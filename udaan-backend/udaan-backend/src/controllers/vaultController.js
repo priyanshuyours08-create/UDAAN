@@ -43,12 +43,22 @@ async function uploadDocument(req, res) {
       if (!profile) return res.status(404).json({ error: 'Applicant profile not found' });
     }
 
+    // Security: Applicants cannot self-verify documents. Any applicant-supplied
+    // verified_status is ignored, ensuring all applicant uploads default to 'pending'.
+    // Only officers and admins can explicitly set verified_status during upload or via the verify endpoint.
+    let verifiedStatus = 'pending';
+    if (['officer', 'admin'].includes(req.user.role) && req.body.verified_status) {
+      if (['pending', 'verified', 'rejected'].includes(req.body.verified_status)) {
+        verifiedStatus = req.body.verified_status;
+      }
+    }
+
     const doc = await DocumentVault.create({
       applicant_id,
       document_type: document_type.trim(),
       file_url,
       expiry_date: expiry_date || null,
-      verified_status: req.body.verified_status || 'verified',
+      verified_status: verifiedStatus,
     });
 
     res.status(201).json(doc);
@@ -81,4 +91,25 @@ async function getVault(req, res) {
   }
 }
 
-module.exports = { uploadDocument, getVault };
+// Officer/Admin endpoint: updates document verified_status ('verified' | 'rejected' | 'pending')
+async function verifyDocument(req, res) {
+  try {
+    const { documentId } = req.params;
+    const { verified_status } = req.body;
+    if (!['verified', 'rejected', 'pending'].includes(verified_status)) {
+      return res.status(400).json({ error: "verified_status must be 'verified', 'rejected', or 'pending'" });
+    }
+
+    const doc = await DocumentVault.findByPk(documentId);
+    if (!doc) return res.status(404).json({ error: 'Document not found' });
+
+    doc.verified_status = verified_status;
+    await doc.save();
+
+    res.json(doc);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+module.exports = { uploadDocument, getVault, verifyDocument };
