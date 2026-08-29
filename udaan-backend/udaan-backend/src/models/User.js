@@ -7,8 +7,12 @@ const User = sequelize.define('User', {
   email: { type: DataTypes.STRING, allowNull: false, unique: true },
   password_hash: { type: DataTypes.STRING, allowNull: false },
   role: {
-    type: DataTypes.ENUM('applicant', 'officer', 'admin'),
+    type: DataTypes.ENUM('applicant', 'officer', 'inspector', 'admin'),
     defaultValue: 'applicant',
+  },
+  department: {
+    type: DataTypes.STRING,
+    allowNull: true,
   },
 });
 

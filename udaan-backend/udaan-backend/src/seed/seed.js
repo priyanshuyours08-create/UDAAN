@@ -1,5 +1,6 @@
 require('dotenv').config();
-const { sequelize, ApprovalRule, Scheme } = require('../models');
+const bcrypt = require('bcryptjs');
+const { sequelize, User, ApprovalRule, Scheme } = require('../models');
 
 const approvalRules = [
   // ---- Food Processing sector, Madhya Pradesh, pre-establishment ----
@@ -154,11 +155,57 @@ const schemes = [
   },
 ];
 
+const seedUsers = [
+  {
+    name: 'Fire Officer',
+    email: 'fire_officer@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'officer',
+    department: 'Fire Department',
+  },
+  {
+    name: 'Pollution Control Officer',
+    email: 'pcb_officer@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'officer',
+    department: 'State Pollution Control Board',
+  },
+  {
+    name: 'Null Dept Officer',
+    email: 'null_dept_officer@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'officer',
+    department: null,
+  },
+  {
+    name: 'Fire Inspector',
+    email: 'fire_inspector@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'inspector',
+    department: 'Fire Department',
+  },
+  {
+    name: 'System Admin',
+    email: 'admin@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'admin',
+    department: null,
+  },
+  {
+    name: 'Test Applicant',
+    email: 'applicant@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'applicant',
+    department: null,
+  },
+];
+
 async function seed() {
   await sequelize.sync({ force: true }); // WARNING: drops and recreates all tables
+  await User.bulkCreate(seedUsers);
   await ApprovalRule.bulkCreate(approvalRules);
   await Scheme.bulkCreate(schemes);
-  console.log(`Seeded ${approvalRules.length} approval rules and ${schemes.length} schemes.`);
+  console.log(`Seeded ${seedUsers.length} users, ${approvalRules.length} approval rules, and ${schemes.length} schemes.`);
   process.exit(0);
 }
 

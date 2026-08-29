@@ -254,6 +254,18 @@ async function decideApplication(req, res) {
     const application = await Application.findByPk(req.params.applicationId);
     if (!application) return res.status(404).json({ error: 'Application not found' });
 
+    const rule = await ApprovalRule.findByPk(application.approval_rule_id);
+    if (!rule) return res.status(404).json({ error: 'Associated approval rule not found' });
+
+    // Fail-closed department authorization:
+    // Admins bypass. Non-admin officers MUST match rule.department.
+    // An officer with a null, missing, or mismatched department is strictly denied HTTP 403.
+    if (req.user.role !== 'admin' && rule.department !== req.user.department) {
+      return res.status(403).json({
+        error: 'You can only decide applications for your own department',
+      });
+    }
+
     application.status = decision;
     application.decided_at = new Date();
     await application.save();
