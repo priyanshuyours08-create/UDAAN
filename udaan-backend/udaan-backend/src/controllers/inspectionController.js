@@ -8,6 +8,7 @@ const {
   Inspection,
   InspectionApplication,
 } = require('../models');
+const { withSqliteWriteLock } = require('../utils/sqliteWriteLock');
 
 // Single-instance per-applicant mutex queue — same pattern as applicationController.
 // Prevents two simultaneous bundle requests from creating duplicate inspections.
@@ -109,7 +110,8 @@ async function bundleInspections(req, res) {
     }
 
     // Use IMMEDIATE transaction for SQLite safety
-    const result = await sequelize.transaction(async (t) => {
+    const result = await withSqliteWriteLock(sequelize, async () => {
+      return await sequelize.transaction(async (t) => {
       let inspection;
       let alreadyExisted = false;
       let newLinksCount = 0;
@@ -190,6 +192,7 @@ async function bundleInspections(req, res) {
       });
 
       return { inspection: fullInspection, alreadyExisted, newLinksCount };
+      });
     });
 
     res.status(alreadyExistedStatus(result.alreadyExisted)).json({
@@ -447,41 +450,6 @@ async function acquireCompletionLock(inspectionId) {
 //
 // Uses the same corrected tailPromise pattern as acquireCompletionLock.
 // ---------------------------------------------------------------------------
-let sqliteWriterQueue = Promise.resolve();
-let sqliteWriterTail = sqliteWriterQueue;
-
-async function acquireSqliteWriterLock() {
-  const previousPromise = sqliteWriterTail;
-
-  let release;
-  const currentPromise = new Promise((resolve) => {
-    release = resolve;
-  });
-
-  const tailPromise = previousPromise.then(() => currentPromise);
-  sqliteWriterTail = tailPromise;
-
-  await previousPromise;
-
-  let released = false;
-
-  return () => {
-    if (released) return;
-    released = true;
-
-    release();
-
-    // Clean up: if we are the tail, reset to a resolved promise so the
-    // chain does not grow unboundedly.
-    if (sqliteWriterTail === tailPromise) {
-      sqliteWriterQueue = Promise.resolve();
-      sqliteWriterTail = sqliteWriterQueue;
-    }
-  };
-}
-
-const isSqlite = sequelize.getDialect() === 'sqlite';
-
 /**
  * PATCH /api/inspections/:inspectionId/complete
  *
@@ -536,16 +504,11 @@ async function completeInspection(req, res) {
     //          serialize IMMEDIATE transactions across different inspections.
     //          Not needed for PostgreSQL/MySQL which support concurrent writers.
     // -----------------------------------------------------------------------
-    let releaseSqliteWriter;
-    try {
-      if (isSqlite) {
-        releaseSqliteWriter = await acquireSqliteWriterLock();
-      }
-
-      // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
       // Layer 2: Start transaction and re-fetch authoritative state
       // ---------------------------------------------------------------------
-      const txResult = await sequelize.transaction(async (t) => {
+      const txResult = await withSqliteWriteLock(sequelize, async () => {
+        return await sequelize.transaction(async (t) => {
         // Re-fetch the inspection INSIDE the transaction — never trust a
         // pre-lock / pre-transaction read.
         const inspection = await Inspection.findByPk(inspectionId, {
@@ -663,6 +626,7 @@ async function completeInspection(req, res) {
         }
 
         return { earlyExit: false };
+        });
       });
 
       // Handle early-exit responses from authoritative checks inside the transaction
@@ -689,12 +653,6 @@ async function completeInspection(req, res) {
         message: 'Inspection completed successfully',
         inspection: finalInspection,
       });
-    } finally {
-      // Release SQLite writer lock (step 4) before per-inspection lock (step 5)
-      if (releaseSqliteWriter) {
-        releaseSqliteWriter();
-      }
-    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {

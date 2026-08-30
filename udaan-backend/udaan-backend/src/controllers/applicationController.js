@@ -1,6 +1,7 @@
 const { Op } = require('sequelize');
 const { sequelize, ApplicantProfile, ApprovalRule, Application, DocumentVault } = require('../models');
 const { computeRiskLevel, routeByRisk } = require('./riskEngine');
+const { withSqliteWriteLock } = require('../utils/sqliteWriteLock');
 
 // Single-instance per-applicant mutex queue to prevent race conditions during parallel submissions.
 // NOTE: For multi-instance production deployments, replace this in-memory Map with Redis (redlock)
@@ -120,71 +121,73 @@ async function submitApplication(req, res) {
     }
 
     // Transaction for atomic submission and avoiding race conditions
-    const createdApplications = await sequelize.transaction(async (t) => {
-      const results = [];
-      for (const rule of rules) {
-        let existing = null;
-        if (!allowResubmission) {
-          existing = await Application.findOne({
-            where: { applicant_id, approval_rule_id: rule.id },
-            order: [['id', 'DESC']],
-            transaction: t,
-          });
-        } else {
-          existing = await Application.findOne({
-            where: {
+    const createdApplications = await withSqliteWriteLock(sequelize, async () => {
+      return await sequelize.transaction(async (t) => {
+        const results = [];
+        for (const rule of rules) {
+          let existing = null;
+          if (!allowResubmission) {
+            existing = await Application.findOne({
+              where: { applicant_id, approval_rule_id: rule.id },
+              order: [['id', 'DESC']],
+              transaction: t,
+            });
+          } else {
+            existing = await Application.findOne({
+              where: {
+                applicant_id,
+                approval_rule_id: rule.id,
+                status: { [Op.notIn]: ['approved', 'auto_approved', 'rejected'] },
+              },
+              order: [['id', 'DESC']],
+              transaction: t,
+            });
+          }
+
+          if (existing) {
+            results.push({
+              application_id: existing.id,
+              approval_name: rule.approval_name,
+              department: rule.department,
+              risk_level: existing.risk_level,
+              status: existing.status,
+              sla_deadline: existing.sla_deadline,
+              already_existed: true,
+            });
+            continue;
+          }
+
+          const riskLevel = computeRiskLevel(rule, profile);
+          const status = routeByRisk(riskLevel);
+
+          const slaDeadline = new Date();
+          slaDeadline.setDate(slaDeadline.getDate() + rule.sla_days);
+
+          const application = await Application.create(
+            {
               applicant_id,
               approval_rule_id: rule.id,
-              status: { [Op.notIn]: ['approved', 'auto_approved', 'rejected'] },
+              status,
+              risk_level: riskLevel,
+              submitted_document_ids: vaultDocIds,
+              sla_deadline: slaDeadline,
+              decided_at: status === 'auto_approved' ? new Date() : null,
             },
-            order: [['id', 'DESC']],
-            transaction: t,
-          });
-        }
+            { transaction: t }
+          );
 
-        if (existing) {
           results.push({
-            application_id: existing.id,
+            application_id: application.id,
             approval_name: rule.approval_name,
             department: rule.department,
-            risk_level: existing.risk_level,
-            status: existing.status,
-            sla_deadline: existing.sla_deadline,
-            already_existed: true,
-          });
-          continue;
-        }
-
-        const riskLevel = computeRiskLevel(rule, profile);
-        const status = routeByRisk(riskLevel);
-
-        const slaDeadline = new Date();
-        slaDeadline.setDate(slaDeadline.getDate() + rule.sla_days);
-
-        const application = await Application.create(
-          {
-            applicant_id,
-            approval_rule_id: rule.id,
-            status,
             risk_level: riskLevel,
-            submitted_document_ids: vaultDocIds,
+            status,
             sla_deadline: slaDeadline,
-            decided_at: status === 'auto_approved' ? new Date() : null,
-          },
-          { transaction: t }
-        );
-
-        results.push({
-          application_id: application.id,
-          approval_name: rule.approval_name,
-          department: rule.department,
-          risk_level: riskLevel,
-          status,
-          sla_deadline: slaDeadline,
-          already_existed: false,
-        });
-      }
-      return results;
+            already_existed: false,
+          });
+        }
+        return results;
+      });
     });
 
     const hasNew = createdApplications.some((a) => !a.already_existed);

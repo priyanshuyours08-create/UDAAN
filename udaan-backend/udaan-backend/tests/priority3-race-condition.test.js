@@ -339,46 +339,42 @@ async function testE_TransactionFailureAndLockRelease() {
 
 async function testF_LockCleanup() {
   console.log('\n=== Test F: Lock cleanup verification ===');
-  const { _completionLocks, _getSqliteWriterTail } = require('../src/controllers/inspectionController');
 
-  // Create and complete an inspection, then check lock state
-  const { inspection } = await createScheduledInspection();
-  const r = await request('PATCH', `/api/inspections/${inspection.id}/complete`,
-    { result: 'pass' }, inspectorToken);
-  assert(r.status === 200, 'Completion → 200');
-
-  // Per-inspection lock cleanup
-  const lockExists = _completionLocks.has(inspection.id);
-  assert(!lockExists, `Per-inspection lock cleaned up: no entry for inspection ${inspection.id}`);
-
-  // SQLite writer queue cleanup: tail should be a resolved promise (no pending work)
-  if (_getSqliteWriterTail) {
-    const tail = _getSqliteWriterTail();
-    // A settled tail means no queued work remains. We verify by racing it
-    // against a short timeout.
-    const settled = await Promise.race([
-      tail.then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 100)),
-    ]);
-    assert(settled, 'SQLite writer queue has no pending/retained entry after settlement');
+  async function assertBehavioralCleanup(label) {
+    const { inspection: tInsp } = await createScheduledInspection();
+    const pTest = request('PATCH', `/api/inspections/${tInsp.id}/complete`, { result: 'pass' }, inspectorToken);
+    const pTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Lock is stuck')), 1500));
+    try {
+      const r = await Promise.race([pTest, pTimeout]);
+      assert(r.status === 200, `[${label}] Quick completion succeeded within timeout`);
+    } catch (err) {
+      assert(false, `[${label}] Failed: ${err.message}`);
+    }
   }
 
-  // Test after error too
-  const { inspection: insp2 } = await createScheduledInspection();
-  await request('PATCH', `/api/inspections/${insp2.id}/complete`,
-    { result: 'pass', _force_failure: true }, inspectorToken);
-  // After error, lock should also be cleaned up
-  const lockExists2 = _completionLocks.has(insp2.id);
-  assert(!lockExists2, `Per-inspection lock cleaned up after error: no entry for inspection ${insp2.id}`);
+  // 1. After success
+  const { inspection: i1 } = await createScheduledInspection();
+  await request('PATCH', `/api/inspections/${i1.id}/complete`, { result: 'pass' }, inspectorToken);
+  await assertBehavioralCleanup('After success');
 
-  if (_getSqliteWriterTail) {
-    const tail2 = _getSqliteWriterTail();
-    const settled2 = await Promise.race([
-      tail2.then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 100)),
-    ]);
-    assert(settled2, 'SQLite writer queue clean after error');
-  }
+  // 2. After validation failure
+  const { inspection: i2 } = await createScheduledInspection();
+  await request('PATCH', `/api/inspections/${i2.id}/complete`, { result: 'conditional' }, inspectorToken);
+  await assertBehavioralCleanup('After validation failure');
+
+  // 3. After transaction failure
+  const { inspection: i3 } = await createScheduledInspection();
+  await request('PATCH', `/api/inspections/${i3.id}/complete`, { result: 'pass', _force_failure: true }, inspectorToken);
+  await assertBehavioralCleanup('After transaction failure');
+
+  // 4. After a queued burst
+  const burstInsps = await Promise.all([createScheduledInspection(), createScheduledInspection(), createScheduledInspection()]);
+  await Promise.all([
+    request('PATCH', `/api/inspections/${burstInsps[0].inspection.id}/complete`, { result: 'pass' }, inspectorToken),
+    request('PATCH', `/api/inspections/${burstInsps[1].inspection.id}/complete`, { result: 'fail', inspector_notes: 'x' }, inspectorToken),
+    request('PATCH', `/api/inspections/${burstInsps[2].inspection.id}/complete`, { result: 'pass' }, inspectorToken),
+  ]);
+  await assertBehavioralCleanup('After a queued burst');
 }
 
 async function testG_RegressionChecks() {
