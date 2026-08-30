@@ -5,6 +5,8 @@ const ApprovalRule = require('./ApprovalRule');
 const Application = require('./Application');
 const DocumentVault = require('./DocumentVault');
 const Scheme = require('./Scheme');
+const Inspection = require('./Inspection');
+const InspectionApplication = require('./InspectionApplication');
 
 User.hasOne(ApplicantProfile, { foreignKey: 'user_id' });
 ApplicantProfile.belongsTo(User, { foreignKey: 'user_id' });
@@ -18,6 +20,15 @@ Application.belongsTo(ApprovalRule, { foreignKey: 'approval_rule_id' });
 ApplicantProfile.hasMany(DocumentVault, { foreignKey: 'applicant_id' });
 DocumentVault.belongsTo(ApplicantProfile, { foreignKey: 'applicant_id' });
 
+// Priority 3: Common Inspection Planner associations
+Inspection.belongsTo(ApplicantProfile, { foreignKey: 'applicant_id' });
+ApplicantProfile.hasMany(Inspection, { foreignKey: 'applicant_id' });
+
+Inspection.belongsTo(User, { as: 'Inspector', foreignKey: 'assigned_inspector_id' });
+
+Inspection.belongsToMany(Application, { through: InspectionApplication, foreignKey: 'inspection_id' });
+Application.belongsToMany(Inspection, { through: InspectionApplication, foreignKey: 'application_id' });
+
 module.exports = {
   sequelize,
   User,
@@ -26,4 +37,6 @@ module.exports = {
   Application,
   DocumentVault,
   Scheme,
+  Inspection,
+  InspectionApplication,
 };

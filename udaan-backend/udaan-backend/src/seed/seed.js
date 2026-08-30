@@ -185,6 +185,13 @@ const seedUsers = [
     department: 'Fire Department',
   },
   {
+    name: 'Pollution Inspector',
+    email: 'pcb_inspector@test.com',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'inspector',
+    department: 'State Pollution Control Board',
+  },
+  {
     name: 'System Admin',
     email: 'admin@test.com',
     password_hash: bcrypt.hashSync('password123', 10),
