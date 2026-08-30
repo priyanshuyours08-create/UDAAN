@@ -37,6 +37,18 @@ const Application = sequelize.define('Application', {
   sla_deadline: { type: DataTypes.DATE },
   submitted_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
   decided_at: { type: DataTypes.DATE, allowNull: true },
+  last_notified_level: {
+    type: DataTypes.ENUM('none', 'warning', 'breach'),
+    allowNull: false,
+    defaultValue: 'none',
+  },
+}, {
+  indexes: [
+    {
+      name: 'app_sla_polling_idx',
+      fields: ['status', 'sla_deadline', 'last_notified_level']
+    }
+  ]
 });
 
 module.exports = Application;

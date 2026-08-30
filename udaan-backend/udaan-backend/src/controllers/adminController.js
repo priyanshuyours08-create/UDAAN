@@ -47,4 +47,15 @@ async function getAnalytics(req, res) {
   }
 }
 
-module.exports = { getAnalytics };
+const { checkAndEscalate } = require('../services/slaEscalationService');
+
+async function runSlaCheck(req, res) {
+  try {
+    const results = await checkAndEscalate();
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+module.exports = { getAnalytics, runSlaCheck };

@@ -9,6 +9,7 @@ const applicationRoutes = require('./routes/applicationRoutes');
 const schemeRoutes = require('./routes/schemeRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const app = express();
 
@@ -25,6 +26,7 @@ app.use('/api/applications', applicationRoutes);
 app.use('/api/schemes', schemeRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/inspections', inspectionRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 

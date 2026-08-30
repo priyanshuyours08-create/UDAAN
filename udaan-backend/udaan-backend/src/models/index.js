@@ -7,6 +7,7 @@ const DocumentVault = require('./DocumentVault');
 const Scheme = require('./Scheme');
 const Inspection = require('./Inspection');
 const InspectionApplication = require('./InspectionApplication');
+const Notification = require('./Notification');
 
 User.hasOne(ApplicantProfile, { foreignKey: 'user_id' });
 ApplicantProfile.belongsTo(User, { foreignKey: 'user_id' });
@@ -29,6 +30,16 @@ Inspection.belongsTo(User, { as: 'Inspector', foreignKey: 'assigned_inspector_id
 Inspection.belongsToMany(Application, { through: InspectionApplication, foreignKey: 'inspection_id' });
 Application.belongsToMany(Inspection, { through: InspectionApplication, foreignKey: 'application_id' });
 
+Notification.belongsTo(User, {
+  foreignKey: 'user_id',
+  onDelete: 'CASCADE',
+  onUpdate: 'CASCADE'
+});
+
+User.hasMany(Notification, {
+  foreignKey: 'user_id'
+});
+
 module.exports = {
   sequelize,
   User,
@@ -39,4 +50,5 @@ module.exports = {
   Scheme,
   Inspection,
   InspectionApplication,
+  Notification,
 };
