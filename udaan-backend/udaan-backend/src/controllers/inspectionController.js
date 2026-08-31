@@ -84,34 +84,36 @@ async function bundleInspections(req, res) {
     // Acquire per-applicant mutex to prevent concurrent bundle races
     releaseLock = await acquireBundleLock(applicant_id);
 
-    // Find eligible applications: pending_inspection + rule requires inspection
-    const eligibleApplications = await Application.findAll({
-      where: {
-        applicant_id,
-        status: 'pending_inspection',
-      },
-      include: [{
-        model: ApprovalRule,
-        where: { requires_inspection: true },
-      }],
-    });
-
-    // Look for existing scheduled inspection for this applicant
-    const existingInspection = await Inspection.findOne({
-      where: {
-        applicant_id,
-        status: 'scheduled',
-      },
-    });
-
-    // No existing scheduled inspection AND no eligible applications
-    if (!existingInspection && eligibleApplications.length === 0) {
-      return res.status(400).json({ error: 'No applications pending inspection for this applicant' });
-    }
-
     // Use IMMEDIATE transaction for SQLite safety
     const result = await withSqliteWriteLock(sequelize, async () => {
       return await sequelize.transaction(async (t) => {
+
+      // Find eligible applications: pending_inspection + rule requires inspection
+      const eligibleApplications = await Application.findAll({
+        where: {
+          applicant_id,
+          status: 'pending_inspection',
+        },
+        include: [{
+          model: ApprovalRule,
+          where: { requires_inspection: true },
+        }],
+        transaction: t
+      });
+
+      // Look for existing scheduled inspection for this applicant
+      const existingInspection = await Inspection.findOne({
+        where: {
+          applicant_id,
+          status: 'scheduled',
+        },
+        transaction: t
+      });
+
+      // No existing scheduled inspection AND no eligible applications
+      if (!existingInspection && eligibleApplications.length === 0) {
+        return { earlyExit: true, status: 400, body: { error: 'No applications pending inspection for this applicant' } };
+      }
       let inspection;
       let alreadyExisted = false;
       let newLinksCount = 0;
@@ -194,6 +196,10 @@ async function bundleInspections(req, res) {
       return { inspection: fullInspection, alreadyExisted, newLinksCount };
       });
     });
+
+    if (result.earlyExit) {
+      return res.status(result.status).json(result.body);
+    }
 
     res.status(alreadyExistedStatus(result.alreadyExisted)).json({
       message: result.alreadyExisted
@@ -602,13 +608,6 @@ async function completeInspection(req, res) {
           // Unexpected status — should not happen, but fail safely
           return { earlyExit: true, status: 409, body: { error: 'Inspection status has changed, completion rejected' } };
         }
-
-        // Test-only forced failure for verifying transaction rollback (Test N).
-        // Gated behind NODE_ENV === 'test' — unreachable in production.
-        if (process.env.NODE_ENV === 'test' && req.body._force_failure === true) {
-          throw new Error('Forced test failure for transaction rollback verification');
-        }
-
         // Update linked applications atomically within the same transaction
         const newStatus = statusMap[result];
         const linkedApps = await Application.findAll({

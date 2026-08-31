@@ -148,6 +148,31 @@ async function seedTestData() {
 }
 
 /**
+ * Wraps a test function to temporarily force a failure on Application.findAll
+ * inside transactions to simulate a failure during rollback testing.
+ */
+async function withForcedFailure(fn) {
+  const originalFindAll = Application.findAll;
+  let stubCalled = false;
+  Application.findAll = async function(opts) {
+    if (opts && opts.transaction) {
+      Application.findAll = originalFindAll;
+      stubCalled = true;
+      throw new Error('Forced test failure for transaction rollback verification');
+    }
+    return originalFindAll.apply(this, arguments);
+  };
+  try {
+    const res = await fn();
+    assert(stubCalled, 'The fault-injection stub was successfully invoked');
+    assert(Application.findAll === originalFindAll, 'original Application.findAll was restored');
+    return res;
+  } finally {
+    Application.findAll = originalFindAll;
+  }
+}
+
+/**
  * Creates a scheduled inspection with linked pending_inspection applications.
  * Returns { inspection, apps }.
  */
@@ -315,8 +340,8 @@ async function testE_TransactionFailureAndLockRelease() {
   const { inspection, apps } = await createScheduledInspection();
 
   // Trigger test-only forced failure
-  const r1 = await request('PATCH', `/api/inspections/${inspection.id}/complete`,
-    { result: 'pass', _force_failure: true }, inspectorToken);
+  const r1 = await withForcedFailure(() => request('PATCH', `/api/inspections/${inspection.id}/complete`,
+    { result: 'pass' }, inspectorToken));
   assert(r1.status === 500, 'Forced failure → 500');
 
   // Verify rollback
@@ -364,7 +389,7 @@ async function testF_LockCleanup() {
 
   // 3. After transaction failure
   const { inspection: i3 } = await createScheduledInspection();
-  await request('PATCH', `/api/inspections/${i3.id}/complete`, { result: 'pass', _force_failure: true }, inspectorToken);
+  await withForcedFailure(() => request('PATCH', `/api/inspections/${i3.id}/complete`, { result: 'pass' }, inspectorToken));
   await assertBehavioralCleanup('After transaction failure');
 
   // 4. After a queued burst
@@ -482,8 +507,8 @@ async function testG_RegressionChecks() {
   // G.11 — Transaction rollback
   console.log('  — Transaction rollback');
   const setupRollback = await createScheduledInspection();
-  const rRollback = await request('PATCH', `/api/inspections/${setupRollback.inspection.id}/complete`,
-    { result: 'conditional', inspector_notes: 'Need more info', _force_failure: true }, inspectorToken);
+  const rRollback = await withForcedFailure(() => request('PATCH', `/api/inspections/${setupRollback.inspection.id}/complete`,
+    { result: 'conditional', inspector_notes: 'Need more info' }, inspectorToken));
   assert(rRollback.status === 500, 'Forced failure → 500');
   const dbRollback = await Inspection.findByPk(setupRollback.inspection.id);
   assert(dbRollback.status === 'scheduled', 'Inspection remains scheduled');

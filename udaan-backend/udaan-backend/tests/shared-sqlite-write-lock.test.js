@@ -139,6 +139,31 @@ async function assertQueueClean(label) {
   }
 }
 
+/**
+ * Wraps a test function to temporarily force a failure on Application.findAll
+ * inside transactions to simulate a failure during rollback testing.
+ */
+async function withForcedFailure(fn) {
+  const originalFindAll = Application.findAll;
+  let stubCalled = false;
+  Application.findAll = async function(opts) {
+    if (opts && opts.transaction) {
+      Application.findAll = originalFindAll; // restore immediately
+      stubCalled = true;
+      throw new Error('Forced test failure for transaction rollback verification');
+    }
+    return originalFindAll.apply(this, arguments);
+  };
+  try {
+    const res = await fn();
+    assert(stubCalled, 'The fault-injection stub was successfully invoked');
+    assert(Application.findAll === originalFindAll, 'original Application.findAll was restored');
+    return res;
+  } finally {
+    Application.findAll = originalFindAll;
+  }
+}
+
 async function testA_SubmissionConcurrency() {
   console.log('\\n=== Test A: Submission concurrency ===');
   
@@ -276,7 +301,7 @@ async function testF_FailureAndQueueRelease() {
   const insp = await Inspection.findOne({ where: { applicant_id: aCompProf.id, status: 'scheduled' } });
   await insp.update({ assigned_inspector_id: inspectorUser1.id });
   
-  const resFail = await request('PATCH', `/api/inspections/${insp.id}/complete`, { result: 'pass', _force_failure: true }, inspectorToken1);
+  const resFail = await withForcedFailure(() => request('PATCH', `/api/inspections/${insp.id}/complete`, { result: 'pass' }, inspectorToken1));
   assert(resFail.status === 500, `Forced failure HTTP 500 (got ${resFail.status})`);
   
   await assertQueueClean('Test F after error');
