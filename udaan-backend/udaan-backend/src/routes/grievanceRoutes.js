@@ -9,5 +9,6 @@ router.get('/assigned', authenticate, authorize('officer', 'admin'), grievanceCo
 router.patch('/:id/classify', authenticate, authorize('admin'), grievanceController.classifyGrievance);
 router.patch('/:id/claim', authenticate, authorize('officer', 'admin'), grievanceController.claimGrievance);
 router.patch('/:id', authenticate, authorize('applicant', 'officer', 'admin'), grievanceController.updateGrievanceStatus);
+router.post('/:id/escalate', authenticate, authorize('applicant'), grievanceController.manualEscalation);
 
 module.exports = router;

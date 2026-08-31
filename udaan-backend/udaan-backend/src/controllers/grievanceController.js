@@ -1,5 +1,6 @@
-const { Grievance, ApplicantProfile, Application, ApprovalRule, sequelize } = require('../models');
+const { Grievance, GrievanceEscalation, ApplicantProfile, Application, ApprovalRule, Notification, sequelize } = require('../models');
 const { withSqliteWriteLock } = require('../utils/sqliteWriteLock');
+const crypto = require('crypto');
 
 async function createGrievance(req, res) {
   try {
@@ -562,11 +563,221 @@ async function updateGrievanceStatus(req, res) {
   }
 }
 
+async function manualEscalation(req, res) {
+  try {
+    const { id } = req.params;
+    if (!/^[1-9]\d*$/.test(id)) return res.status(400).json({ error: 'Invalid grievance ID' });
+
+    if (req.user.role !== 'applicant') {
+      return res.status(403).json({ error: 'Only applicants can manually escalate' });
+    }
+
+    const idempotencyKey = req.headers['idempotency-key'];
+    if (!idempotencyKey || typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(idempotencyKey.trim())) {
+      return res.status(400).json({ error: 'Missing or malformed Idempotency-Key header' });
+    }
+    const trimmedIdempotencyKey = idempotencyKey.trim();
+
+    const allowedKeys = ['reason', 'state_version'];
+    for (const key of Object.keys(req.body)) {
+      if (!allowedKeys.includes(key)) return res.status(400).json({ error: `Field '${key}' not allowed` });
+    }
+
+    const { reason, state_version } = req.body;
+
+    if (!Number.isInteger(state_version) || state_version < 0) {
+      return res.status(400).json({ error: 'state_version must be a non-negative integer' });
+    }
+
+    if (typeof reason !== 'string' || reason.trim().length === 0 || reason.trim().length > 2000) {
+      return res.status(400).json({ error: 'reason must be a string between 1 and 2000 characters' });
+    }
+    const normalizedReason = reason.trim();
+
+    const requestFingerprint = crypto.createHash('sha256')
+      .update(JSON.stringify({
+        operation: 'manual_grievance_escalation',
+        grievance_id: Number(id),
+        reason: normalizedReason
+      }))
+      .digest('hex');
+
+    let escalationHours = Number(process.env.GRIEVANCE_ESCALATION_HOURS);
+    if (!Number.isFinite(escalationHours) || escalationHours <= 0) {
+      escalationHours = 48;
+    }
+
+    let earlyResponse = null;
+
+    await withSqliteWriteLock(sequelize, async () => {
+      await sequelize.transaction(async (t) => {
+        const grievance = await Grievance.findByPk(id, { transaction: t });
+        if (!grievance) {
+          earlyResponse = { status: 404, body: { error: 'Grievance not found' } };
+          return;
+        }
+
+        const profile = await ApplicantProfile.findOne({ where: { user_id: req.user.id }, transaction: t });
+        if (!profile || grievance.applicant_id !== profile.id) {
+          earlyResponse = { status: 403, body: { error: 'Grievance does not belong to you' } };
+          return;
+        }
+
+        const existingEscalation = await GrievanceEscalation.findOne({
+          where: { grievance_id: grievance.id, idempotency_key: trimmedIdempotencyKey },
+          transaction: t
+        });
+
+        if (existingEscalation) {
+          if (existingEscalation.request_fingerprint === requestFingerprint) {
+            earlyResponse = {
+              status: 200,
+              body: {
+                message: 'Escalated successfully',
+                replayed: true,
+                grievance: {
+                  id: grievance.id,
+                  status: grievance.status,
+                  escalation_level: grievance.escalation_level,
+                  sla_deadline: grievance.sla_deadline,
+                  next_escalation_at: grievance.next_escalation_at,
+                  state_version: grievance.state_version,
+                  assigned_to: grievance.assigned_to
+                },
+                escalation: {
+                  id: existingEscalation.id,
+                  from_level: existingEscalation.from_level,
+                  to_level: existingEscalation.to_level,
+                  escalation_type: existingEscalation.escalation_type,
+                  reason: existingEscalation.reason,
+                  createdAt: existingEscalation.createdAt
+                }
+              }
+            };
+            return;
+          } else {
+            earlyResponse = { status: 409, body: { error: 'Idempotency key collision' } };
+            return;
+          }
+        }
+
+        if (grievance.status === 'resolved' || grievance.status === 'closed') {
+          earlyResponse = { status: 409, body: { error: 'Cannot escalate resolved or closed grievance' } };
+          return;
+        }
+
+        if (grievance.escalation_level >= 3) {
+          earlyResponse = { status: 409, body: { error: 'Maximum escalation level reached' } };
+          return;
+        }
+
+        if (grievance.state_version !== state_version) {
+          earlyResponse = { status: 409, body: { error: 'Stale state_version' } };
+          return;
+        }
+
+        const now = new Date();
+
+        if (grievance.escalation_level > 0) {
+          if (!grievance.next_escalation_at || grievance.next_escalation_at > now) {
+            earlyResponse = { status: 409, body: { error: 'Escalation cooldown active' } };
+            return;
+          }
+        }
+
+        const from_level = grievance.escalation_level;
+        const to_level = from_level + 1;
+        let next_escalation_at = grievance.next_escalation_at;
+        if (to_level < 3) {
+          next_escalation_at = new Date(now.getTime() + escalationHours * 60 * 60 * 1000);
+        } else {
+          next_escalation_at = null;
+        }
+
+        const assigned_to = to_level >= 2 ? null : grievance.assigned_to;
+
+        const [affectedRows] = await Grievance.update({
+          status: 'escalated',
+          escalation_level: to_level,
+          state_version: grievance.state_version + 1,
+          next_escalation_at,
+          assigned_to
+        }, {
+          where: {
+            id: grievance.id,
+            state_version: state_version,
+            escalation_level: from_level,
+            status: grievance.status,
+            next_escalation_at: grievance.next_escalation_at
+          },
+          transaction: t
+        });
+
+        if (affectedRows === 0) {
+          earlyResponse = { status: 409, body: { error: 'State conflict' } };
+          return;
+        }
+
+        const newEscalation = await GrievanceEscalation.create({
+          grievance_id: grievance.id,
+          from_level,
+          to_level,
+          escalation_type: 'manual',
+          escalated_by: req.user.id,
+          reason: normalizedReason,
+          idempotency_key: trimmedIdempotencyKey,
+          request_fingerprint: requestFingerprint
+        }, { transaction: t });
+
+        await Notification.create({
+          user_id: req.user.id,
+          type: 'grievance_update',
+          title: `Grievance Escalated to Level ${to_level}`,
+          message: `Your grievance has been successfully manually escalated to level ${to_level}.`,
+          reference_type: 'grievance',
+          reference_id: grievance.id,
+          is_read: false
+        }, { transaction: t });
+
+        earlyResponse = {
+          status: 200,
+          body: {
+            message: 'Escalated successfully',
+            replayed: false,
+            grievance: {
+              id: grievance.id,
+              status: 'escalated',
+              escalation_level: to_level,
+              sla_deadline: grievance.sla_deadline,
+              next_escalation_at: next_escalation_at,
+              state_version: state_version + 1,
+              assigned_to: assigned_to
+            },
+            escalation: {
+              id: newEscalation.id,
+              from_level: newEscalation.from_level,
+              to_level: newEscalation.to_level,
+              escalation_type: newEscalation.escalation_type,
+              reason: newEscalation.reason,
+              createdAt: newEscalation.createdAt
+            }
+          }
+        };
+      });
+    });
+
+    res.status(earlyResponse.status).json(earlyResponse.body);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+}
+
 module.exports = {
   createGrievance,
   getMyGrievances,
   classifyGrievance,
   claimGrievance,
   getAssignedGrievances,
-  updateGrievanceStatus
+  updateGrievanceStatus,
+  manualEscalation
 };
