@@ -41,26 +41,28 @@ async function runTests() {
       }
     };
 
-    let slaCalls = 0;
-    let fakeSlaPromise = null;
-    let throwOnSla = false;
-    const fakeSlaCheck = async () => {
-      slaCalls++;
-      if (throwOnSla) throw new Error('Simulated SLA error');
-      if (fakeSlaPromise) await fakeSlaPromise;
+    let complianceCalls = 0;
+    let fakeCompliancePromise = null;
+    let throwOnCompliance = false;
+    const fakeComplianceCheck = async () => {
+      complianceCalls++;
+      if (throwOnCompliance) throw new Error('Simulated Compliance error');
+      if (fakeCompliancePromise) await fakeCompliancePromise;
+      return { success: true };
     };
 
     let logMessages = [];
     let errorMessages = [];
     const fakeLogger = {
       log: (msg) => logMessages.push(msg),
+      warn: (msg) => logMessages.push(msg),
       error: (msg, err) => errorMessages.push(msg)
     };
 
     // A. Exact expression & B. Single registration
     console.log('=== A. Exact expression & B. Single registration ===');
-    const task1 = startSlaCron({ cron: fakeCron, checkAndEscalate: fakeSlaCheck, logger: fakeLogger });
-    const task2 = startSlaCron({ cron: fakeCron, checkAndEscalate: fakeSlaCheck, logger: fakeLogger });
+    const task1 = startSlaCron({ cron: fakeCron, runComplianceChecks: fakeComplianceCheck, logger: fakeLogger });
+    const task2 = startSlaCron({ cron: fakeCron, runComplianceChecks: fakeComplianceCheck, logger: fakeLogger });
     
     check(cronSchedules.length === 1, 'cron.schedule invoked exactly once');
     check(cronSchedules[0].expr === '*/5 * * * *', 'cron.schedule receives exactly */5 * * * *');
@@ -77,39 +79,39 @@ async function runTests() {
     console.log('\n=== D. Successful tick ===');
     const tick = cronSchedules[0].callback;
     await tick();
-    check(slaCalls === 1, 'tick invokes checkAndEscalate exactly once');
+    check(complianceCalls === 1, 'tick invokes runComplianceChecks exactly once');
     
     // E. Overlap protection
     console.log('\n=== E. Overlap protection ===');
-    let resolveSla;
-    fakeSlaPromise = new Promise((resolve) => { resolveSla = resolve; });
+    let resolveCompliance;
+    fakeCompliancePromise = new Promise((resolve) => { resolveCompliance = resolve; });
     
-    // Start tick 1 (it will hang on fakeSlaPromise)
+    // Start tick 1 (it will hang on fakeCompliancePromise)
     const tick1Promise = tick();
     
     // Start tick 2 immediately
     await tick();
     check(logMessages.some(m => m.includes('skipped')), 'second tick is skipped due to overlap guard');
-    check(slaCalls === 2, 'checkAndEscalate call count remains exactly one (for the overlap test, it should be 2 total: 1 from D, 1 from tick1)');
+    check(complianceCalls === 2, 'runComplianceChecks call count remains exactly one (for the overlap test, it should be 2 total: 1 from D, 1 from tick1)');
     
     // Resolve tick 1
-    resolveSla();
+    resolveCompliance();
     await tick1Promise;
     
     // Later tick succeeds
-    fakeSlaPromise = null;
+    fakeCompliancePromise = null;
     await tick();
-    check(slaCalls === 3, 'a later tick executes successfully');
+    check(complianceCalls === 3, 'a later tick executes successfully');
 
     // F. Error recovery
     console.log('\n=== F. Error recovery ===');
-    throwOnSla = true;
+    throwOnCompliance = true;
     await tick();
     check(errorMessages.length === 1, 'error is logged');
     
-    throwOnSla = false;
+    throwOnCompliance = false;
     await tick();
-    check(slaCalls === 5, 'overlap state resets, next tick succeeds');
+    check(complianceCalls === 5, 'overlap state resets, next tick succeeds');
 
     // G. Stop lifecycle
     console.log('\n=== G. Stop lifecycle ===');
@@ -122,7 +124,7 @@ async function runTests() {
 
     // Reset for next test
     cronSchedules = [];
-    const taskAfterStop = startSlaCron({ cron: fakeCron, checkAndEscalate: fakeSlaCheck, logger: fakeLogger });
+    const taskAfterStop = startSlaCron({ cron: fakeCron, runComplianceChecks: fakeComplianceCheck, logger: fakeLogger });
     check(cronSchedules.length === 1, 'start after a complete stop behaves correctly without duplicate tasks');
     stopSlaCron();
 

@@ -1,5 +1,5 @@
 const realCron = require('node-cron');
-const { checkAndEscalate: realCheckAndEscalate } = require('./slaEscalationService');
+const { runComplianceChecks: realRunComplianceChecks } = require('./complianceOrchestrator');
 const realLogger = console;
 
 let activeTask = null;
@@ -9,7 +9,7 @@ let activeSlaPromise = null;
 
 function startSlaCron(deps = {}) {
   const cron = deps.cron || realCron;
-  const checkAndEscalate = deps.checkAndEscalate || realCheckAndEscalate;
+  const runComplianceChecks = deps.runComplianceChecks || realRunComplianceChecks;
   const logger = deps.logger || realLogger;
 
   if (activeTask) {
@@ -28,7 +28,7 @@ function startSlaCron(deps = {}) {
     }
     
     if (isSlaCheckRunning) {
-      logger.log('SLA check skipped: previous tick is still running');
+      logger.log('Compliance check skipped: previous tick is still running');
       return;
     }
 
@@ -36,9 +36,12 @@ function startSlaCron(deps = {}) {
     
     const currentPromise = (async () => {
       try {
-        await checkAndEscalate();
+        const results = await runComplianceChecks(deps.complianceOptions || {});
+        if (!results.success) {
+          logger.warn('Compliance check completed with failures:', results);
+        }
       } catch (error) {
-        logger.error('Error during SLA cron execution:', error);
+        logger.error('Error during compliance cron execution:', error);
       } finally {
         isSlaCheckRunning = false;
         if (activeSlaPromise === currentPromise) {

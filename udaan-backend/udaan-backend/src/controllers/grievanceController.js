@@ -553,13 +553,39 @@ async function updateGrievanceStatus(req, res) {
           return;
         }
 
+        if (status === 'resolved' || status === 'in_progress') {
+          const profile = await ApplicantProfile.findByPk(grievance.applicant_id, { transaction: t });
+          if (profile) {
+            let title = '';
+            let message = '';
+            if (status === 'resolved') {
+              title = 'Grievance Resolved';
+              message = `Your grievance has been resolved. Notes: ${resolution_notes.trim()}`;
+            } else {
+              title = 'Grievance In Progress';
+              message = 'Your grievance is now being actively processed.';
+            }
+
+            await Notification.create({
+              user_id: profile.user_id,
+              type: 'grievance_update',
+              title,
+              message,
+              reference_type: 'grievance',
+              reference_id: grievance.id,
+              is_read: false
+            }, { transaction: t });
+          }
+        }
+
         earlyResponse = { status: 200, body: { message: 'Status updated successfully' } };
       });
     });
 
     res.status(earlyResponse.status).json(earlyResponse.body);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[GrievanceController] Unexpected error in status update:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 }
 

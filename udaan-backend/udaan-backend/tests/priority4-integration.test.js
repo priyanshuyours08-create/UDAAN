@@ -18,7 +18,7 @@ const {
   Notification
 } = require('../src/models');
 const app = require('../src/app');
-const { checkAndEscalate } = require('../src/services/slaEscalationService');
+const { runComplianceChecks } = require('../src/services/complianceOrchestrator');
 
 let server;
 let baseUrl;
@@ -151,10 +151,10 @@ async function runTests() {
     console.log('=== 1. SLA check + first-time application submission ===');
     const [r1_submit, r1_sla] = await Promise.all([
       request('POST', '/api/applications/submit', { applicant_id: applicantProfile.id }, applicantToken),
-      checkAndEscalate()
+      runComplianceChecks()
     ]);
     check(r1_submit.status === 201, 'First-time submission created (HTTP 201)');
-    check(r1_sla && r1_sla.skipped_race !== undefined, 'SLA check succeeded without crashing');
+    check(r1_sla && r1_sla.success === true, 'SLA check succeeded without crashing');
     await checkGroupings('Scenario 1');
 
     console.log('\n=== 2. SLA check + inspection bundle ===');
@@ -163,10 +163,10 @@ async function runTests() {
     
     const [r2_bundle, r2_sla] = await Promise.all([
       request('POST', '/api/inspections/bundle', { applicant_id: applicantProfile.id }, applicantToken),
-      checkAndEscalate()
+      runComplianceChecks()
     ]);
     check(r2_bundle.status === 201, 'First-time bundle created (HTTP 201) because a genuine new inspection link was created');
-    check(r2_sla && r2_sla.skipped_race !== undefined, 'SLA check succeeded');
+    check(r2_sla && r2_sla.success === true, 'SLA check succeeded');
     await checkGroupings('Scenario 2');
 
     console.log('\n=== 3. SLA check + inspection completion ===');
@@ -174,10 +174,10 @@ async function runTests() {
     await insp.update({ assigned_inspector_id: inspectorUser.id });
     const [r3_complete, r3_sla] = await Promise.all([
       request('PATCH', `/api/inspections/${insp.id}/complete`, { result: 'pass' }, inspectorToken),
-      checkAndEscalate()
+      runComplianceChecks()
     ]);
     check(r3_complete.status === 200, 'Inspection completion succeeded (HTTP 200)');
-    check(r3_sla && r3_sla.skipped_race !== undefined, 'SLA check succeeded');
+    check(r3_sla && r3_sla.success === true, 'SLA check succeeded');
     await checkGroupings('Scenario 3');
 
     // Deterministic Tests for Scenario 4 (A, B, C)
@@ -287,7 +287,7 @@ async function runTests() {
     const [r4c_bun, r4c_com, r4c_sla] = await Promise.all([
       request('POST', '/api/inspections/bundle', { applicant_id: applicantProfile.id }, applicantToken),
       request('PATCH', `/api/inspections/${insp4c.id}/complete`, { result: 'pass' }, inspectorToken),
-      checkAndEscalate()
+      runComplianceChecks()
     ]);
     
     console.log(`\n[Database Evidence for 4C]`);
@@ -308,10 +308,10 @@ async function runTests() {
     console.log('\n=== 5. Manual POST /api/admin/run-sla-check + direct checkAndEscalate() ===');
     const [r5_api, r5_direct] = await Promise.all([
       request('POST', '/api/admin/run-sla-check', null, adminToken),
-      checkAndEscalate()
+      runComplianceChecks()
     ]);
     check(r5_api.status === 200, 'API call returned 200');
-    check(r5_direct && r5_direct.skipped_race !== undefined, 'Direct call returned safely');
+    check(r5_direct && r5_direct.success === true, 'Direct call returned safely');
     await checkGroupings('Scenario 5');
 
     console.log('\n=== 6. Two manual run-sla-check requests simultaneously ===');
@@ -325,10 +325,10 @@ async function runTests() {
 
     console.log('\n=== 7. Cron tick + manual run-sla-check simultaneously ===');
     const [r7_cron, r7_api] = await Promise.all([
-      checkAndEscalate(),
+      runComplianceChecks(),
       request('POST', '/api/admin/run-sla-check', null, adminToken)
     ]);
-    check(r7_cron && r7_cron.skipped_race !== undefined, 'Cron tick returned safely');
+    check(r7_cron && r7_cron.success === true, 'Cron tick returned safely');
     check(r7_api.status === 200, 'API call returned 200');
     await checkGroupings('Scenario 7');
 

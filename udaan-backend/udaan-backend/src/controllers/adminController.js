@@ -47,14 +47,18 @@ async function getAnalytics(req, res) {
   }
 }
 
-const { checkAndEscalate } = require('../services/slaEscalationService');
+const complianceOrchestrator = require('../services/complianceOrchestrator');
 
 async function runSlaCheck(req, res) {
   try {
-    const results = await checkAndEscalate();
+    const results = await complianceOrchestrator.runComplianceChecks();
+    if (!results.success && !results.partial_failure) {
+      return res.status(500).json(results);
+    }
     res.json(results);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[AdminController] Orchestrator unexpected rejection:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 }
 
