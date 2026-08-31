@@ -8,7 +8,8 @@ const testFiles = [
   'priority4-sla-escalation.test.js',
   'priority4-cron.test.js',
   'priority4-integration.test.js',
-  'priority4-lifecycle.test.js'
+  'priority4-lifecycle.test.js',
+  'priority5-grievance-foundation.test.js'
 ];
 
 let failed = false;

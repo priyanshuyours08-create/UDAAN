@@ -27,6 +27,7 @@ app.use('/api/schemes', schemeRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/inspections', inspectionRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/grievances', require('./routes/grievanceRoutes'));
 
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 

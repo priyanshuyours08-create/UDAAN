@@ -9,6 +9,9 @@ const Inspection = require('./Inspection');
 const InspectionApplication = require('./InspectionApplication');
 const Notification = require('./Notification');
 
+const Grievance = require('./Grievance');
+const GrievanceEscalation = require('./GrievanceEscalation');
+
 User.hasOne(ApplicantProfile, { foreignKey: 'user_id' });
 ApplicantProfile.belongsTo(User, { foreignKey: 'user_id' });
 
@@ -40,6 +43,25 @@ User.hasMany(Notification, {
   foreignKey: 'user_id'
 });
 
+// Priority 5: Grievance Redressal
+ApplicantProfile.hasMany(Grievance, { foreignKey: 'applicant_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+Grievance.belongsTo(ApplicantProfile, { foreignKey: 'applicant_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+
+Application.hasMany(Grievance, { foreignKey: 'application_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+Grievance.belongsTo(Application, { foreignKey: 'application_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+
+User.hasMany(Grievance, { as: 'AssignedGrievances', foreignKey: 'assigned_to', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+Grievance.belongsTo(User, { as: 'Assignee', foreignKey: 'assigned_to', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+
+User.hasMany(Grievance, { as: 'ClassifiedGrievances', foreignKey: 'classified_by', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+Grievance.belongsTo(User, { as: 'Classifier', foreignKey: 'classified_by', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+
+Grievance.hasMany(GrievanceEscalation, { as: 'Escalations', foreignKey: 'grievance_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+GrievanceEscalation.belongsTo(Grievance, { foreignKey: 'grievance_id', onDelete: 'RESTRICT', onUpdate: 'CASCADE' });
+
+User.hasMany(GrievanceEscalation, { as: 'GrievanceEscalations', foreignKey: 'escalated_by', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+GrievanceEscalation.belongsTo(User, { as: 'Actor', foreignKey: 'escalated_by', onDelete: 'SET NULL', onUpdate: 'CASCADE' });
+
 module.exports = {
   sequelize,
   User,
@@ -51,4 +73,6 @@ module.exports = {
   Inspection,
   InspectionApplication,
   Notification,
+  Grievance,
+  GrievanceEscalation,
 };
