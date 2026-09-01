@@ -26,6 +26,7 @@ const Inspection = sequelize.define('Inspection', {
     defaultValue: null,
   },
   assigned_inspector_id: { type: DataTypes.INTEGER, allowNull: true },
+  completed_at: { type: DataTypes.DATE, allowNull: true },
 });
 
 module.exports = Inspection;

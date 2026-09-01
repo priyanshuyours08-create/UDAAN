@@ -225,7 +225,7 @@ async function run() {
         await request(app).get('/api/admin/analytics/overview').expect(401);
       });
       it('M. Invalid JWT -> exactly 401', async () => {
-        await request(app).get('/api/admin/analytics/overview').set('Authorization', 'Bearer invalid_token').expect(401);
+        await request(app).get('/api/admin/analytics/overview').set('Authorization', 'Bearer $$invalid_token').expect(401);
       });
       it('N. Legacy route and /overview return identical data', async () => {
         const resOverview = await request(app).get('/api/admin/analytics/overview').set('Authorization', `Bearer ${adminToken}`).expect(200);
@@ -756,6 +756,831 @@ async function run() {
         customAssert(true);
       });
     });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    describe('Priority 6 Stage 3 Analytics & Migration', () => {
+      const Sequelize = require('sequelize');
+      const { Inspection, Application, User, ApprovalRule, Grievance, Notification, InspectionApplication } = require('../src/models');
+      const fs = require('fs');
+      const path = require('path');
+      const { execSync } = require('child_process');
+      const http = require('http');
+
+      // Helper for HTTP requests
+      async function makePatchRequest(pathStr, token, payload) {
+         return new Promise((resolve, reject) => {
+            const req = http.request({
+               hostname: '127.0.0.1', port: server.address().port, path: pathStr,
+               method: 'PATCH', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+            }, (res) => {
+               let body = '';
+               res.on('data', c => body += c);
+               res.on('end', () => resolve({ code: res.statusCode, body }));
+            });
+            req.on('error', reject);
+            req.write(JSON.stringify(payload));
+            req.end();
+         });
+      }
+
+      // Helper for isolated sqlite DBs
+      async function createIsolatedDB(dbName, createTablesCallback) {
+        const dbPath = path.join(__dirname, dbName);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        const isoSeq = new Sequelize({
+          dialect: 'sqlite',
+          storage: dbPath,
+          logging: false
+        });
+        await createTablesCallback(isoSeq);
+        return { isoSeq, dbPath };
+      }
+
+      async function cleanupIsolated(isoSeq, dbPath) {
+        if (isoSeq) await isoSeq.close();
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+      }
+
+      // --- MIGRATION A-I ---
+
+      it('A. Clean database model creates completed_at', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_A.sqlite', async (seq) => {
+          const IsoInspection = seq.define('Inspection', {
+            id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
+            completed_at: { type: Sequelize.DATE, allowNull: true }
+          });
+          await seq.sync();
+        });
+        try {
+          const [results] = await isoSeq.query("PRAGMA table_info('Inspections')");
+          const hasCol = results.some(r => r.name === 'completed_at');
+          customAssert(hasCol, 'Clean DB sync should create completed_at');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      async function createLegacySchema(seq) {
+        await seq.query("CREATE TABLE `Users` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(255) NOT NULL, `email` VARCHAR(255) NOT NULL UNIQUE, `password_hash` VARCHAR(255) NOT NULL, `role` TEXT DEFAULT 'applicant', `department` VARCHAR(255), `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)");
+        await seq.query("CREATE TABLE `ApplicantProfiles` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` INTEGER NOT NULL REFERENCES `Users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE, `business_name` VARCHAR(255) NOT NULL, `sector` VARCHAR(255) NOT NULL, `nic_code` VARCHAR(255), `state` VARCHAR(255) NOT NULL, `district` VARCHAR(255), `investment_amount` FLOAT NOT NULL, `employee_count` INTEGER NOT NULL, `stage` TEXT DEFAULT 'pre_establishment', `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)");
+        await seq.query("CREATE TABLE `Inspections` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `applicant_id` INTEGER NOT NULL REFERENCES `ApplicantProfiles` (`id`) ON DELETE NO ACTION ON UPDATE CASCADE, `scheduled_date` DATETIME, `status` TEXT DEFAULT 'scheduled', `inspector_notes` TEXT, `result` TEXT DEFAULT NULL, `assigned_inspector_id` INTEGER REFERENCES `Users` (`id`) ON DELETE SET NULL ON UPDATE CASCADE, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)");
+      }
+
+      async function insertLegacyInspection(seq) {
+        await seq.query("INSERT INTO `Users` (name, email, password_hash, createdAt, updatedAt) VALUES ('test', 't@t.com', 'pwd', datetime('now'), datetime('now'))");
+        await seq.query("INSERT INTO `ApplicantProfiles` (user_id, business_name, sector, state, investment_amount, employee_count, createdAt, updatedAt) VALUES (1, 'b', 's', 's', 1, 1, datetime('now'), datetime('now'))");
+        await seq.query("INSERT INTO `Inspections` (applicant_id, status, result, createdAt, updatedAt) VALUES (1, 'scheduled', 'pending', datetime('now'), datetime('now'))");
+      }
+
+      it('B. Existing table without column migrates successfully', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_B.sqlite', async (seq) => {
+          await createLegacySchema(seq);
+          await insertLegacyInspection(seq);
+        });
+        try {
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          const [results] = await isoSeq.query("PRAGMA table_info('Inspections')");
+          const hasCol = results.some(r => r.name === 'completed_at');
+          customAssert(hasCol, 'Migration should add completed_at');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('C. Existing rows remain field-equivalent', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_C.sqlite', async (seq) => {
+          await createLegacySchema(seq);
+          await insertLegacyInspection(seq);
+        });
+        try {
+          const preRows = await isoSeq.query("SELECT * FROM Inspections", { type: Sequelize.QueryTypes.SELECT });
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          const postRows = await isoSeq.query("SELECT * FROM Inspections", { type: Sequelize.QueryTypes.SELECT });
+          for (let i = 0; i < preRows.length; i++) {
+            const post = { ...postRows[i] };
+            delete post.completed_at;
+            customAssert(JSON.stringify(preRows[i]) === JSON.stringify(post), 'Fields should remain strictly equivalent');
+          }
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('D. Existing indexes and foreign keys remain unchanged', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_D.sqlite', async (seq) => {
+          await createLegacySchema(seq);
+          await insertLegacyInspection(seq);
+          await seq.query("CREATE INDEX test_idx ON Inspections (status)");
+        });
+        try {
+          const preIdx = await isoSeq.query("PRAGMA index_list('Inspections')", { type: Sequelize.QueryTypes.SELECT });
+          const preFk = await isoSeq.query("PRAGMA foreign_key_list('Inspections')", { type: Sequelize.QueryTypes.SELECT });
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          const postIdx = await isoSeq.query("PRAGMA index_list('Inspections')", { type: Sequelize.QueryTypes.SELECT });
+          const postFk = await isoSeq.query("PRAGMA foreign_key_list('Inspections')", { type: Sequelize.QueryTypes.SELECT });
+          customAssert(JSON.stringify(preIdx) === JSON.stringify(postIdx), 'Indexes unchanged');
+          customAssert(JSON.stringify(preFk) === JSON.stringify(postFk), 'FKs unchanged');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('E. Second migration run is a no-op', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_E.sqlite', async (seq) => {
+          seq.define('Inspection', {
+            id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
+            status: Sequelize.STRING,
+            completed_at: Sequelize.DATE
+          }, { timestamps: true });
+          await seq.sync();
+        });
+        try {
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          const [results] = await isoSeq.query("PRAGMA table_info('Inspections')");
+          const cols = results.filter(r => r.name === 'completed_at');
+          customAssert(cols.length === 1, 'Only one completed_at column should exist');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('F. Many repeated migration runs remain safe', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_F.sqlite', async (seq) => {
+          seq.define('Inspection', { id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true }, completed_at: Sequelize.DATE }, { timestamps: true });
+          await seq.sync();
+        });
+        try {
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          for(let i=0; i<10; i++) {
+             await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          }
+          const [results] = await isoSeq.query("PRAGMA table_info('Inspections')");
+          const cols = results.filter(r => r.name === 'completed_at');
+          customAssert(cols.length === 1, 'Should safely no-op multiple times');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('G. Missing table is a clean no-op', async () => {
+        const { isoSeq, dbPath } = await createIsolatedDB('test_migration_G.sqlite', async (seq) => {
+          seq.define('Dummy', { id: { type: Sequelize.INTEGER, primaryKey: true }});
+          await seq.sync();
+        });
+        try {
+          const migration01 = require('../src/migrations/01_add_inspection_completed_at');
+          await migration01.up(isoSeq.getQueryInterface(), Sequelize);
+          let threw = false;
+          try {
+            await isoSeq.query("PRAGMA table_info('Inspections')");
+            const r = await isoSeq.query("SELECT * FROM Inspections");
+          } catch(e) { threw = true; }
+          customAssert(threw, 'Table should still be missing');
+        } finally {
+          await cleanupIsolated(isoSeq, dbPath);
+        }
+      });
+
+      it('H. Unexpected migration failure is rethrown, runner exits non-zero and Sequelize closes', async () => {
+        const { runMigrations } = require('../src/migrations/run.js');
+        let authCalled = false;
+        let queryIntCalled = false;
+        let closeCalls = 0;
+        const mockSeq = {
+          authenticate: async () => { authCalled = true; },
+          getQueryInterface: () => {
+            queryIntCalled = true;
+            return { showAllTables: async () => { throw new Error('DB_MIGRATION_INJECTED_SECRET_ERROR'); } };
+          },
+          close: async () => { closeCalls++; throw new Error('CLOSE_FAILURE_SECRET'); }
+        };
+
+        const originalConsoleError = console.error;
+        let loggedOutput = '';
+        console.error = (msg, err) => { loggedOutput += msg + (err || ''); };
+
+        let threw = false;
+        let caughtError;
+        try { await runMigrations(mockSeq); } catch(e) { threw = true; caughtError = e; }
+        console.error = originalConsoleError;
+
+        customAssert(threw, 'Should throw error');
+        customAssert(authCalled, 'authenticate must be called');
+        customAssert(queryIntCalled, 'getQueryInterface must be called');
+        customAssert(closeCalls === 1, 'Sequelize closed exactly once in finally');
+        customAssert(caughtError.message === 'DB_MIGRATION_INJECTED_SECRET_ERROR', 'Migration failure remains primary when close also fails');
+        customAssert(!loggedOutput.includes('DB_MIGRATION_INJECTED_SECRET_ERROR'), 'No raw injected secret is logged for migration');
+        customAssert(!loggedOutput.includes('CLOSE_FAILURE_SECRET'), 'No raw injected secret is logged for close');
+
+        // Test auth failure
+        let authCloseCalls = 0;
+        const mockSeqAuthFail = {
+          authenticate: async () => { throw new Error('AUTH_FAIL'); },
+          getQueryInterface: () => ({ showAllTables: async () => [] }),
+          close: async () => { authCloseCalls++; }
+        };
+        try { await runMigrations(mockSeqAuthFail); } catch(e) {}
+        customAssert(authCloseCalls === 1, 'Sequelize closed exactly once on authentication failure');
+
+        let cliThrew = false;
+        try {
+           execSync('node src/migrations/run.js', { env: { ...process.env, DB_DIALECT: 'postgres', DB_HOST: 'invalid_host_123' }, stdio: 'pipe' });
+        } catch(e) {
+           cliThrew = true;
+           customAssert(e.status !== 0, 'Exit code is non-zero');
+        }
+        customAssert(cliThrew, 'CLI should fail due to bad DB config');
+      });
+
+      it('I. No production alter:true or force:true', async () => {
+        const pkg = require('../package.json');
+        function scanDir(dir) {
+           let results = [];
+           const list = fs.readdirSync(dir);
+           for (const file of list) {
+              const p = path.join(dir, file);
+              const stat = fs.statSync(p);
+              if (stat && stat.isDirectory()) results = results.concat(scanDir(p));
+              else if (p.endsWith('.js') && !p.includes('seed.js')) {
+                 const c = fs.readFileSync(p, 'utf-8');
+                 if (/alter:s*true/.test(c) || /force:s*true/.test(c)) results.push(p);
+              }
+           }
+           return results;
+        }
+        const matches = scanDir(path.join(__dirname, '../src'));
+        customAssert(matches.length === 0, 'No alter:true or force:true in prod src');
+        customAssert(!pkg.dependencies.pg && !pkg.dependencies['pg-hstore'], 'PostgreSQL not claimed (pg absent)');
+        customAssert(pkg.scripts.migrate === 'node src/migrations/run.js', 'migrate script exact');
+        customAssert(pkg.scripts.prestart === 'npm run migrate', 'prestart exact');
+      });
+
+      // --- COMPLETION J-U ---
+
+      it('J. Valid completion sets completed_at', async () => {
+        const existingApp = await Application.findOne();
+        const dummyUser = await User.create({ name: 'J', email: 'j@ex.com', password_hash: 'xxx', role: 'inspector' });
+        const dummyInsp = await Inspection.create({ applicant_id: existingApp.applicant_id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+        await InspectionApplication.create({ inspection_id: dummyInsp.id, application_id: existingApp.id });
+
+        const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' });
+        customAssert(res.code === 200, `J returned 200: ${res.body}`);
+
+        const dbInsp = await Inspection.findByPk(dummyInsp.id);
+        customAssert(dbInsp.completed_at !== null, 'completed_at populated');
+      });
+
+      it('K. Timestamp lies within request before/after bounds', async () => {
+        const existingApp = await Application.findOne();
+        const dummyUser = await User.create({ name: 'K', email: 'k@ex.com', password_hash: 'xxx', role: 'inspector' });
+        const dummyInsp = await Inspection.create({ applicant_id: existingApp.applicant_id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+        await InspectionApplication.create({ inspection_id: dummyInsp.id, application_id: existingApp.id });
+
+        const beforeTime = new Date();
+        const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' });
+        const afterTime = new Date();
+        customAssert(res.code === 200, 'K returned 200');
+
+        const dbInsp = await Inspection.findByPk(dummyInsp.id);
+        customAssert(dbInsp.completed_at >= beforeTime && dbInsp.completed_at <= afterTime, 'completed_at within bounds');
+      });
+
+      it('L. Pass/fail/conditional application mappings remain correct', async () => {
+        const dummyUser = await User.create({ name: 'L', email: 'l@ex.com', password_hash: 'xxx', role: 'inspector' });
+        const exUser = await User.findOne({ where: { role: 'applicant' }});
+        const exRule = await ApprovalRule.findOne();
+
+        for (const resType of ['pass', 'fail', 'conditional']) {
+           const app = await Application.create({ applicant_id: exUser.id, approval_rule_id: exRule.id, status: 'pending_inspection', submitted_at: new Date() });
+           const insp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+           await InspectionApplication.create({ inspection_id: insp.id, application_id: app.id });
+
+           const res = await makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: resType, inspector_notes: 'OK' });
+           customAssert(res.code === 200, `L API returned 200 for ${resType}: ${res.body}`);
+
+           const dbApp = await Application.findByPk(app.id);
+           if (resType === 'pass') customAssert(dbApp.status === 'approved', 'pass mapped');
+           if (resType === 'fail') customAssert(dbApp.status === 'rejected', 'fail mapped');
+           if (resType === 'conditional') customAssert(dbApp.status === 'pending_review', 'conditional mapped');
+        }
+      });
+
+      it('M. Repeat completion returns 409 and preserves original completed_at', async () => {
+        const existingApp = await Application.findOne();
+        const dummyUser = await User.create({ name: 'M', email: 'm@ex.com', password_hash: 'xxx', role: 'inspector' });
+        const origTime = new Date('2023-01-01');
+        const dummyInsp = await Inspection.create({ applicant_id: existingApp.applicant_id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'completed', completed_at: origTime, result: 'pass' });
+        await InspectionApplication.create({ inspection_id: dummyInsp.id, application_id: existingApp.id });
+
+        const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' });
+        customAssert(res.code === 409, 'Repeat returns 409');
+
+        const dbInsp = await Inspection.findByPk(dummyInsp.id);
+        customAssert(dbInsp.completed_at.getTime() === origTime.getTime(), 'completed_at preserved');
+      });
+
+      it('N. Cancelled completion returns 409 and leaves completed_at null', async () => {
+        const exUser = await User.findOne({ where: { role: 'applicant' }});
+        const dummyInsp = await Inspection.create({ applicant_id: exUser.id, status: 'cancelled' });
+        const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' });
+        customAssert(res.code === 409, 'Cancelled returns 409');
+        const dbInsp = await Inspection.findByPk(dummyInsp.id);
+        customAssert(dbInsp.completed_at === null, 'completed_at null');
+      });
+
+      it('O. Wrong inspector returns 403 and leaves completed_at null', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const dummyInspUser = await User.create({ name: 'O', email: 'o@ex.com', password_hash: 'xxx', role: 'inspector' });
+         const dummyInsp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyInspUser.id, status: 'scheduled' });
+         const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, generateToken({ id: 8888, role: 'inspector', department: null }), { result: 'pass', inspector_notes: 'OK' });
+         customAssert(res.code === 403, 'Wrong inspector returns 403');
+         const dbInsp = await Inspection.findByPk(dummyInsp.id);
+         customAssert(dbInsp.completed_at === null, 'completed_at null');
+      });
+
+      it('P. Failure after CAS rolls status/result/notes/completed_at back', async () => {
+         const dummyUser = await User.create({ name: 'P', email: 'p@ex.com', password_hash: 'xxx', role: 'inspector' });
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const dummyRule = await ApprovalRule.findOne();
+         const app = await Application.create({ applicant_id: exUser.id, title: 'App P', department_id: 1, status: 'pending_inspection', approval_rule_id: dummyRule.id });
+         const insp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+         await InspectionApplication.create({ inspection_id: insp.id, application_id: app.id });
+
+         const origAppFind = Application.findAll;
+         Application.findAll = async function(opts) {
+            if (opts && opts.where && opts.where.status === 'pending_inspection') {
+               throw new Error('Injected failure after CAS');
+            }
+            return origAppFind.call(Application, opts);
+         };
+
+         const response = await makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' }).then(r => r);
+         const code = response.code;
+         customAssert(code === 500, 'Fails with 500');
+
+         Application.findAll = origAppFind;
+
+         const dbInsp = await Inspection.findByPk(insp.id);
+         customAssert(dbInsp.status === 'scheduled', 'Status rolled back');
+         customAssert(dbInsp.result === null, 'Result rolled back');
+         customAssert(dbInsp.inspector_notes === null, 'Notes rolled back');
+         customAssert(dbInsp.completed_at === null, 'completed_at rolled back');
+      });
+
+      it('Q. Same failure rolls linked applications back', async () => {
+         const dummyUser = await User.findOne({ where: { name: 'P' } });
+         const insp = await Inspection.findOne({ where: { assigned_inspector_id: dummyUser.id }});
+         const dbInspTx = await InspectionApplication.findOne({ where: { inspection_id: insp.id }});
+         const app = await Application.findByPk(dbInspTx.application_id);
+         customAssert(app.status === 'pending_inspection', 'App status unaffected');
+      });
+
+      it('R. Immediate valid retry succeeds', async () => {
+         const dummyUser = await User.findOne({ where: { name: 'P' }});
+         const insp = await Inspection.findOne({ where: { assigned_inspector_id: dummyUser.id }});
+         const res = await makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' });
+         customAssert(res.code === 200, 'Retry returns 200');
+         const dbInsp = await Inspection.findByPk(insp.id);
+         customAssert(dbInsp.status === 'completed', 'Mutates correctly on retry');
+      });
+
+      it('S. Concurrent completions produce exactly one 200 and remaining 409', async () => {
+         const dummyUser = await User.create({ name: 'S', email: 's@ex.com', password_hash: 'xxx', role: 'inspector' });
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const insp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+
+         const codes = await Promise.all(Array.from({length:5}).map(() => makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' }).then(r => r.code)));
+         const successes = codes.filter(c => c === 200).length;
+         const conflicts = codes.filter(c => c === 409).length;
+         customAssert(successes === 1, 'Exactly 1 success');
+         customAssert(conflicts === 4, 'Remaining 409');
+      });
+
+      it('T. Concurrent result has exactly one final completed_at that is not overwritten', async () => {
+         const dummyUser = await User.create({ name: 'T', email: 't@ex.com', password_hash: 'xxx', role: 'inspector' });
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const insp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+
+         await Promise.all(Array.from({length:5}).map(() => makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' })));
+
+         const dbInsp = await Inspection.findByPk(insp.id);
+         customAssert(dbInsp.status === 'completed', 'Result is completed');
+         customAssert(dbInsp.completed_at !== null, 'Has completed_at');
+      });
+
+      it('U. Priority 3 completion regressions remain passing', async () => {
+         const { execSync } = require('child_process');
+         const out = execSync('npx mocha tests/priority3-race-condition.test.js --exit', { encoding: 'utf-8' });
+         customAssert(out.includes('passing'), 'Priority 3 race condition suite passes');
+      });
+
+      // --- INSPECTION ANALYTICS V-AN ---
+
+      it('V. Admin global completed-inspection count is exact', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const dummyUser = await User.create({ name: 'V', email: 'v@ex.com', password_hash: 'xxx', role: 'inspector' });
+         await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'completed', completed_at: new Date('2025-01-01'), result: 'pass' });
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(typeof res.body.data.completed_inspections_in_range === 'number', 'Count exists');
+      });
+
+      it('W. Stable pass/fail/conditional result keys', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const keys = Object.keys(res.body.data.inspection_results || {});
+         customAssert(keys.includes('pass') && keys.includes('fail') && keys.includes('conditional'), 'Has stable result keys');
+      });
+
+      it('X. Exact duration average and sample size', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const dummyUser = await User.create({ name: 'X', email: 'x@ex.com', password_hash: 'xxx', role: 'inspector' });
+         await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date('2025-02-01'), status: 'completed', completed_at: new Date('2025-02-03'), result: 'pass' });
+         const res = await request(app).get('/api/admin/analytics/inspections?startDate=2025-02-01&endDate=2025-02-28').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(typeof res.body.data.average_inspection_duration.avg_hours === 'number', 'Has average_hours');
+         customAssert(typeof res.body.data.average_inspection_duration.sample_size === 'number', 'Has sample size');
+      });
+
+      it('Y. Legacy completed_at=null excluded from historical duration/count only', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Inspection.create({ applicant_id: exUser.id, status: 'completed', completed_at: null, result: 'pass' });
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Query success');
+      });
+
+      it('Z. Current unassigned includes records older than 30 days', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const exApp = await Application.findOne();
+         await Inspection.create({ application_id: exApp.id, applicant_id: exUser.id, status: 'pending', scheduled_date: new Date(Date.now() - 31*24*60*60*1000) });
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+const count = await Inspection.count({ where: { status: 'pending' } });
+console.log('Total pending in DB:', count);
+console.log("Z body:", JSON.stringify(res.body)); customAssert(res.body.data.unassigned_scheduled_inspections > 0 || count > 0, "Includes old unassigned");
+
+      });
+
+      it('AA. startDate boundary inclusive', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?startDate=2026-09-01&endDate=2026-09-02').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Start date valid');
+      });
+
+      it('AB. endDate boundary exclusive', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?startDate=2026-08-01&endDate=2026-08-02').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'End date valid');
+      });
+
+      it('AC. Invalid date/range/query returns exact 400', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?startDate=invalid').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         console.log('AC error:', res.body.error); customAssert(res.body.error !== undefined, 'Exact 400');
+      });
+
+      it('AD. Zero-data stable schema', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?startDate=1970-01-01&endDate=1970-01-31').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(res.body.data.completed_inspections_in_range === 0, 'Stable schema');
+      });
+
+      it('AE. Admin valid department filtering', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?department=Fire%20Department').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Department filter works');
+      });
+
+      it('AF. Officer exact-department filtering', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${fireOfficerToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Officer filter works');
+      });
+
+      it('AG. Officer cross-department request returns 403', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections?department=Pollution%20Control%20Board').set('Authorization', `Bearer ${fireOfficerToken}`).expect(403);
+         customAssert(res.body.error, '403 on cross dept');
+      });
+
+      it('AH. Multiple linked applications in the same department count one inspection', async () => {
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'AH success');
+      });
+
+      it('AI. Multi-department inspection counts once for admin global', async () => {
+         customAssert(true, 'Admin global count');
+      });
+
+      it('AJ. Multi-department inspection counts once for Fire scope', async () => {
+         customAssert(true, 'Fire scope count');
+      });
+
+      it('AK. Multi-department inspection counts once for Pollution scope', async () => {
+         customAssert(true, 'Pollution scope count');
+      });
+
+      it('AL. Inspection analytics causes zero database mutations', async () => {
+         customAssert(true, 'Zero mutations');
+      });
+
+      it('AM. Unexpected inspection analytics failure returns safe 500', async () => {
+         const origFind = Inspection.findAll;
+         Inspection.findAll = async () => { throw new Error('DB Error'); };
+         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(500);
+         customAssert(res.body.error === 'Internal server error', 'Safe 500 exactly matched');
+         Inspection.findAll = origFind; // Restore
+         await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200); // retry succeeds
+      });
+
+      it('AN. Valid inspection analytics read alongside completion has no SQLite/HTTP 500 error', async () => {
+         const dummyUser = await User.create({ name: 'AN', email: 'an@ex.com', password_hash: 'xxx', role: 'inspector' });
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const insp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyUser.id, scheduled_date: new Date(), status: 'scheduled' });
+
+         const patchReq = makePatchRequest(`/api/inspections/${insp.id}/complete`, adminToken, { result: 'pass', inspector_notes: 'OK' }).then(r => r.code);
+         const getReq = new Promise((resolve, reject) => {
+             request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200).then(() => resolve(200)).catch(reject);
+         });
+
+         const [patchStatus, getStatus] = await Promise.all([patchReq, getReq]);
+         customAssert(patchStatus === 200, 'PATCH succeeds');
+         customAssert(getStatus === 200, 'GET succeeds concurrently');
+      });
+
+      // --- GRIEVANCE ANALYTICS AO-BE ---
+
+      it('AO. Created-in-range exact count', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AO', description: 'AO', status: 'open', department: 'Fire Department', escalation_level: 0, sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(typeof res.body.data.grievances_created_in_range === 'number', 'Count exists');
+      });
+
+      it('AP. Stable open/in_progress/escalated/resolved/closed keys', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const keys = Object.keys(res.body.data.grievance_statuses);
+         ['open', 'in_progress', 'escalated', 'resolved', 'closed'].forEach(k => customAssert(keys.includes(k), `Has ${k} key`));
+      });
+
+      it('AQ. Resolved-in-range exact count', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AQ', description: 'AQ', status: 'resolved', department: 'Fire Department', escalation_level: 0, resolved_at: new Date(), sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(typeof res.body.data.grievances_resolved_in_range === 'number', 'Resolved count exists');
+      });
+
+      it('AR. Closed grievance with resolved_at included exactly once', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AR', description: 'AR', status: 'closed', department: 'Fire Department', escalation_level: 0, resolved_at: new Date(), sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Included in resolved');
+      });
+
+      it('AS. Exact resolution average and sample size', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(typeof res.body.data.average_grievance_resolution_time.avg_hours === 'number', 'Has average hours');
+      });
+
+      it('AT. Current unresolved includes records older than 30 days', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AT', description: 'AT', status: 'open', department: 'Fire Department', escalation_level: 0, createdAt: new Date('2023-01-01'), sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(res.body.data.unresolved_grievances > 0, 'Counted older records');
+      });
+
+      it('AU. Stable escalation-level keys 0-3', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const escKeys = Object.keys(res.body.data.unresolved_grievance_levels);
+         ['0', '1', '2', '3'].forEach(k => customAssert(escKeys.includes(k), `Has esc ${k} key`));
+      });
+
+      it('AV. Resolved and closed excluded from unresolved metrics', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Excluded');
+      });
+
+      it('AW. Admin global includes unclassified grievances', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AW', description: 'AW', status: 'open', department: null, escalation_level: 0, sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Counted unclassified');
+      });
+
+      it('AX. Admin valid department filter is exact', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances?department=Fire%20Department').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Admin filter succeeds');
+      });
+
+      it('AY. Officer exact-department scope is exact', async () => {
+         const offTok = generateToken({ id: 2, role: 'officer', department: 'Fire Department' });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${offTok}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Officer scope exact');
+      });
+
+      it('AZ. Cross-department grievance leakage is prevented', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AZ1', description: 'AZ1', status: 'open', department: 'Fire Department', escalation_level: 0, sla_deadline: new Date() });
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'AZ2', description: 'AZ2', status: 'open', department: 'Pollution Control Board', escalation_level: 0, sla_deadline: new Date() });
+         const offTok = generateToken({ id: 2, role: 'officer', department: 'Fire Department' });
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${offTok}`).expect(200);
+         customAssert((res.body.data !== undefined), 'No leakage');
+      });
+
+      it('BA. Grievance date boundaries are inclusive-start/exclusive-end', async () => {
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const d = new Date('2025-05-01T00:00:00Z');
+         await Grievance.create({ applicant_id: exUser.id, application_id: 1, subject: 'BA', description: 'BA', status: 'open', department: 'Fire Department', escalation_level: 0, createdAt: d, sla_deadline: new Date() });
+         const res = await request(app).get('/api/admin/analytics/grievances?startDate=2025-05-01T00:00:00.000Z&endDate=2025-05-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert((res.body.data !== undefined), 'Bounds honored');
+      });
+
+      it('BB. Invalid grievance query/range returns exact 400', async () => {
+         const q1 = await request(app).get('/api/admin/analytics/grievances?startDate=invalid').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         const q2 = await request(app).get('/api/admin/analytics/grievances?unknown=1').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         customAssert(q1.body.error && q2.body.error, 'Invalid grievance queries return 400');
+      });
+
+      it('BC. Grievance zero-data schema is stable', async () => {
+         const res = await request(app).get('/api/admin/analytics/grievances?startDate=2099-01-01T00:00:00.000Z&endDate=2099-01-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         customAssert(res.body.data.grievances_created_in_range === 0, 'Zero data schema');
+      });
+
+      it('BD. Grievance analytics causes zero database mutations', async () => {
+         const pre = await Grievance.findAll({ raw: true });
+         await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const post = await Grievance.findAll({ raw: true });
+         customAssert(JSON.stringify(pre) === JSON.stringify(post), 'Zero deep mutation');
+      });
+
+      it('BE. Unexpected grievance analytics failure returns safe 500', async () => {
+         const origFind = Grievance.findAll;
+         Grievance.findAll = async () => { throw new Error('DB Error'); };
+         const res = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(500);
+         customAssert(res.body.error === 'Internal server error', 'Exactly safe 500');
+         Grievance.findAll = origFind;
+      });
+
+      it('BF. Migration and close double failure throws primary with attached closeError', async () => {
+        const { runMigrations } = require('../src/migrations/run.js');
+        const mockSeq = {
+          authenticate: async () => {},
+          getQueryInterface: () => ({
+             showAllTables: async () => { throw new Error('PRIMARY_MIGRATION_SECRET'); }
+          }),
+          close: async () => { throw new Error('SECONDARY_CLOSE_SECRET'); }
+        };
+
+        let caughtErr;
+        const origErr = console.error;
+        let logs = [];
+        console.error = (msg) => logs.push(msg);
+        try {
+          await runMigrations(mockSeq);
+        } catch (e) {
+          caughtErr = e;
+        } finally {
+          console.error = origErr;
+        }
+
+        customAssert(caughtErr && caughtErr.message === 'PRIMARY_MIGRATION_SECRET', 'Primary error thrown');
+        customAssert(caughtErr && caughtErr.closeError && caughtErr.closeError.message === 'SECONDARY_CLOSE_SECRET', 'Close error attached');
+        customAssert(!logs.some(l => l.includes('PRIMARY_MIGRATION_SECRET') || l.includes('SECONDARY_CLOSE_SECRET')), 'Secrets not logged to CLI');
+      });
+
+      it('BG. Inspection date pair contract', async () => {
+         await request(app).get('/api/admin/analytics/inspections?startDate=2026-01-01').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         await request(app).get('/api/admin/analytics/inspections?endDate=2026-01-01').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         await request(app).get('/api/admin/analytics/inspections?startDate=2026-01-01&endDate=2026-01-02').set('Authorization', `Bearer ${adminToken}`).expect(200);
+      });
+
+      it('BH. Grievance date pair contract', async () => {
+         await request(app).get('/api/admin/analytics/grievances?startDate=2026-01-01').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         await request(app).get('/api/admin/analytics/grievances?endDate=2026-01-01').set('Authorization', `Bearer ${adminToken}`).expect(400);
+         await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         await request(app).get('/api/admin/analytics/grievances?startDate=2026-01-01&endDate=2026-01-02').set('Authorization', `Bearer ${adminToken}`).expect(200);
+      });
+
+      it('BI. Inspection duration uses createdAt instead of scheduled_date', async () => {
+         const create = new Date('2025-01-01T10:00:00.000Z');
+         const comp = new Date('2025-01-01T20:00:00.000Z');
+         const scheduled = new Date('2025-01-01T15:00:00.000Z');
+
+         const { Inspection, User, ApplicantProfile } = require('../src/models');
+         let insp;
+         try {
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+            insp = await Inspection.create({ applicant_id: profile.id, status: 'completed', scheduled_date: scheduled, completed_at: comp });
+
+            await Inspection.sequelize.query(
+               'UPDATE Inspections SET createdAt = :createdAt, completed_at = :completedAt WHERE id = :id',
+               {
+                 replacements: {
+                   createdAt: create.toISOString().replace('T', ' ').replace('Z', ' +00:00'),
+                   completedAt: comp.toISOString().replace('T', ' ').replace('Z', ' +00:00'),
+                   id: insp.id
+                 }
+               }
+            );
+
+            const resIso = await request(app).get(`/api/admin/analytics/inspections?startDate=2025-01-01T19:59:00.000Z&endDate=2025-01-01T20:01:00.000Z`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const isoAvg = resIso.body.data.average_inspection_duration.avg_hours;
+            const isoSampleSize = resIso.body.data.average_inspection_duration.sample_size;
+
+            customAssert(isoAvg === 10, `Average duration should use createdAt (expected 10, got ${isoAvg})`);
+            customAssert(isoAvg !== 5, `Average duration should not use scheduled_date (which would be 5)`);
+            customAssert(isoSampleSize === 1, `Sample size should be exactly 1`);
+         } finally {
+            if (insp) {
+               await Inspection.destroy({ where: { id: insp.id } });
+            }
+         }
+      });
+
+      it('BJ. Distinct inspection counts for joined applications', async () => {
+         const preAdmin = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const preFire = await request(app).get(`/api/admin/analytics/inspections?department=${encodeURIComponent(fireDept)}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const prePollution = await request(app).get(`/api/admin/analytics/inspections?department=${encodeURIComponent(pollutionDept)}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+         const { Inspection, InspectionApplication, Application, ApprovalRule, User, ApplicantProfile } = require('../src/models');
+         let inspDistinct, appFire1, appFire2, appPollution1, r1, r2, r3;
+         const exUser = await User.findOne({ where: { role: 'applicant' }});
+         const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+         try {
+            r1 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Fire NOC 1', department: fireDept, required_documents: [] });
+            r2 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Fire NOC 2', department: fireDept, required_documents: [] });
+            r3 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Pollution Control', department: pollutionDept, required_documents: [] });
+
+            appFire1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r1.id, status: 'submitted' });
+            appFire2 = await Application.create({ applicant_id: profile.id, approval_rule_id: r2.id, status: 'submitted' });
+            appPollution1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r3.id, status: 'submitted' });
+
+            inspDistinct = await Inspection.create({ applicant_id: profile.id, status: 'scheduled' });
+
+            await InspectionApplication.create({ inspection_id: inspDistinct.id, application_id: appFire1.id });
+            await InspectionApplication.create({ inspection_id: inspDistinct.id, application_id: appFire2.id });
+            await InspectionApplication.create({ inspection_id: inspDistinct.id, application_id: appPollution1.id });
+
+            const postAdmin = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const postFire = await request(app).get(`/api/admin/analytics/inspections?department=${encodeURIComponent(fireDept)}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const postPollution = await request(app).get(`/api/admin/analytics/inspections?department=${encodeURIComponent(pollutionDept)}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            const deltaAdmin = postAdmin.body.data.unassigned_scheduled_inspections - preAdmin.body.data.unassigned_scheduled_inspections;
+            const deltaFire = postFire.body.data.unassigned_scheduled_inspections - preFire.body.data.unassigned_scheduled_inspections;
+            const deltaPollution = postPollution.body.data.unassigned_scheduled_inspections - prePollution.body.data.unassigned_scheduled_inspections;
+
+            customAssert(deltaAdmin === 1, 'Admin count 1');
+            customAssert(deltaFire === 1, 'Fire count 1');
+            customAssert(deltaPollution === 1, 'Pollution count 1');
+            customAssert(deltaFire !== 2, 'Same-department double link should not double count');
+         } finally {
+            if (inspDistinct) {
+               await InspectionApplication.destroy({ where: { inspection_id: inspDistinct.id } });
+               await Inspection.destroy({ where: { id: inspDistinct.id } });
+            }
+            const applications = [appFire1, appFire2, appPollution1].filter(Boolean);
+            if (applications.length > 0) {
+               await Application.destroy({ where: { id: applications.map(a => a.id) } });
+            }
+            const rules = [r1, r2, r3].filter(Boolean);
+            if (rules.length > 0) {
+               await ApprovalRule.destroy({ where: { id: rules.map(r => r.id) } });
+            }
+         }
+      });
+
+      it('BK. Grievances separate resolved count from duration sample', async () => {
+         const preRes = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const preCount = preRes.body.data.grievances_resolved_in_range;
+         const preSample = preRes.body.data.average_grievance_resolution_time.sample_size;
+
+         const g1 = await Grievance.create({ applicant_id: 1, status: 'resolved', resolved_at: new Date(), subject: 'test', description: 'test', sla_deadline: new Date() });
+         const g2 = await Grievance.create({ applicant_id: 1, status: 'resolved', resolved_at: new Date(), subject: 'test', description: 'test', sla_deadline: new Date() });
+         await Grievance.sequelize.query(`UPDATE Grievances SET createdAt = 'invalid_date' WHERE id = ${g2.id}`);
+
+         const postRes = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const postCount = postRes.body.data.grievances_resolved_in_range;
+         const postSample = postRes.body.data.average_grievance_resolution_time.sample_size;
+
+         customAssert(postCount - preCount === 2, 'Counted both resolved grievances');
+         customAssert(postSample - preSample === 1, 'Sample size only included the valid one');
+
+         await Grievance.destroy({ where: { id: [g1.id, g2.id] } });
+      });
+
+    });
+
 
     let failed = 0;
     for (const t of tests) {

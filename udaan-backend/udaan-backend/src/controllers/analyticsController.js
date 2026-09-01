@@ -1,5 +1,5 @@
 const { Op, Sequelize } = require('sequelize');
-const { Application, ApprovalRule, Grievance, GrievanceEscalation } = require('../models');
+const { Application, ApprovalRule, Grievance, GrievanceEscalation, Inspection, InspectionApplication } = require('../models');
 
 function parseDateValid(val) {
   if (Array.isArray(val)) return null;
@@ -181,6 +181,7 @@ async function getOverviewAnalytics(req, res) {
     const pending_workload = await Application.count(pendingOptions);
 
     res.json({
+      success: true,
       generated_at: now.toISOString(),
       historical_range: {
         start: startDate.toISOString(),
@@ -201,7 +202,7 @@ async function getOverviewAnalytics(req, res) {
     });
 
   } catch (err) {
-    console.error('[AnalyticsController] Unexpected error:', err);
+    console.error('[AnalyticsController] Unexpected error');
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -287,7 +288,7 @@ async function getSlaAnalytics(req, res) {
     });
 
   } catch (err) {
-    console.error('[AnalyticsController SLA] Unexpected error:', err);
+    console.error('[AnalyticsController SLA] Unexpected error');
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -434,9 +435,285 @@ async function getDepartmentBottleneckAnalytics(req, res) {
     });
 
   } catch (err) {
-    console.error('[AnalyticsController Bottleneck] Unexpected error:', err);
+    console.error('[AnalyticsController Bottleneck] Unexpected error');
     res.status(500).json({ error: 'Internal server error' });
   }
 }
 
-module.exports = { getOverviewAnalytics, getSlaAnalytics, getDepartmentBottleneckAnalytics };
+async function getInspectionAnalytics(req, res) {
+  try {
+    let startDate, endDate;
+    const now = new Date();
+
+    const allowedQueries = ['department', 'startDate', 'endDate'];
+    const providedQueries = Object.keys(req.query);
+    for (const key of providedQueries) {
+      if (!allowedQueries.includes(key)) {
+        return res.status(400).json({ error: `Unknown query parameter: ${key}` });
+      }
+    }
+
+    if (Array.isArray(req.query.startDate) || Array.isArray(req.query.endDate) || Array.isArray(req.query.department)) {
+      return res.status(400).json({ error: 'Repeated query parameters are not allowed' });
+    }
+
+    if (!req.query.startDate && !req.query.endDate) {
+      endDate = now;
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    } else if (req.query.startDate && req.query.endDate) {
+      startDate = parseDateValid(req.query.startDate);
+      endDate = parseDateValid(req.query.endDate);
+
+      if (!startDate || !endDate) {
+        return res.status(400).json({ error: 'Invalid calendar timestamp for startDate or endDate' });
+      }
+
+      if (startDate >= endDate) {
+        return res.status(400).json({ error: 'startDate must be before endDate' });
+      }
+
+      const diffDays = (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24);
+      if (diffDays > 366) {
+        return res.status(400).json({ error: 'Historical range cannot exceed 366 days' });
+      }
+    } else {
+      return res.status(400).json({ error: 'Both startDate and endDate must be provided if either is supplied' });
+    }
+
+    const { department } = req.analyticsScope;
+
+    const completedInspections = await Inspection.findAll({
+      where: {
+        status: 'completed',
+        completed_at: {
+          [Op.gte]: startDate,
+          [Op.lt]: endDate
+        }
+      },
+      include: department ? [{
+        model: Application,
+        required: true,
+        include: [{
+          model: ApprovalRule,
+          required: true,
+          where: { department }
+        }]
+      }] : [],
+      attributes: ['id', 'createdAt', 'completed_at', 'result']
+    });
+
+    const uniqueInspections = new Map();
+    for (const insp of completedInspections) {
+      uniqueInspections.set(insp.id, insp);
+    }
+
+    let totalDurationMs = 0;
+    let completed_sample_size = 0;
+    const resultsCohort = { pass: 0, fail: 0, conditional: 0 };
+
+    for (const insp of uniqueInspections.values()) {
+      if (insp.result && resultsCohort[insp.result] !== undefined) {
+         resultsCohort[insp.result]++;
+      }
+      const created = new Date(insp.createdAt);
+      const completed = new Date(insp.completed_at);
+      if (!isNaN(created.getTime()) && !isNaN(completed.getTime())) {
+        totalDurationMs += (completed.getTime() - created.getTime());
+        completed_sample_size++;
+      }
+    }
+
+    const round2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+    let average_completion_hours = 0.0;
+    if (completed_sample_size > 0) {
+      average_completion_hours = round2(totalDurationMs / (1000 * 60 * 60) / completed_sample_size);
+    }
+
+    const unassignedWhere = { status: 'scheduled', assigned_inspector_id: null };
+    const unassignedInspections = await Inspection.count({
+      distinct: true,
+      where: unassignedWhere,
+      include: department ? [{
+        model: Application,
+        required: true,
+        include: [{
+          model: ApprovalRule,
+          required: true,
+          where: { department }
+        }]
+      }] : []
+    });
+
+    res.json({
+      success: true,
+      generated_at: now.toISOString(),
+      historical_range: {
+        start: startDate.toISOString(),
+        end: endDate.toISOString()
+      },
+      current_state_scope: "all_active_records",
+      department_scope: department || null,
+      data: {
+        completed_inspections_in_range: uniqueInspections.size,
+        inspection_results: resultsCohort,
+        average_inspection_duration: {
+          avg_hours: average_completion_hours,
+          sample_size: completed_sample_size
+        },
+        unassigned_scheduled_inspections: unassignedInspections
+      }
+    });
+
+  } catch (err) {
+    console.error('[AnalyticsController Inspection] Unexpected error', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+async function getGrievanceAnalytics(req, res) {
+  try {
+    let startDate, endDate;
+    const now = new Date();
+
+    const allowedQueries = ['department', 'startDate', 'endDate'];
+    const providedQueries = Object.keys(req.query);
+    for (const key of providedQueries) {
+      if (!allowedQueries.includes(key)) {
+        return res.status(400).json({ error: `Unknown query parameter: ${key}` });
+      }
+    }
+
+    if (Array.isArray(req.query.startDate) || Array.isArray(req.query.endDate) || Array.isArray(req.query.department)) {
+      return res.status(400).json({ error: 'Repeated query parameters are not allowed' });
+    }
+
+    if (!req.query.startDate && !req.query.endDate) {
+      endDate = now;
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    } else if (req.query.startDate && req.query.endDate) {
+      startDate = parseDateValid(req.query.startDate);
+      endDate = parseDateValid(req.query.endDate);
+
+      if (!startDate || !endDate) {
+        return res.status(400).json({ error: 'Invalid calendar timestamp for startDate or endDate' });
+      }
+
+      if (startDate >= endDate) {
+        return res.status(400).json({ error: 'startDate must be before endDate' });
+      }
+
+      const diffDays = (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24);
+      if (diffDays > 366) {
+        return res.status(400).json({ error: 'Historical range cannot exceed 366 days' });
+      }
+    } else {
+      return res.status(400).json({ error: 'Both startDate and endDate must be provided if either is supplied' });
+    }
+
+    const { department } = req.analyticsScope;
+
+    const whereClauseRange = {
+      createdAt: {
+        [Op.gte]: startDate,
+        [Op.lt]: endDate
+      }
+    };
+    if (department) {
+      whereClauseRange.department = department;
+    }
+
+    const filedGrievances = await Grievance.findAll({
+      where: whereClauseRange,
+      attributes: ['status']
+    });
+
+    let grievances_filed_in_range = filedGrievances.length;
+    const grievance_statuses_for_created_cohort = { open: 0, in_progress: 0, escalated: 0, resolved: 0, closed: 0 };
+    for (const g of filedGrievances) {
+       if (grievance_statuses_for_created_cohort[g.status] !== undefined) {
+          grievance_statuses_for_created_cohort[g.status]++;
+       }
+    }
+
+    const whereClauseUnresolved = {
+      status: { [Op.in]: ['open', 'in_progress', 'escalated'] }
+    };
+    if (department) {
+      whereClauseUnresolved.department = department;
+    }
+
+    const unresolvedGrievances = await Grievance.findAll({
+      where: whereClauseUnresolved,
+      attributes: ['escalation_level']
+    });
+
+    const unresolved_escalation_levels = { "0": 0, "1": 0, "2": 0, "3": 0 };
+    for (const g of unresolvedGrievances) {
+       if (unresolved_escalation_levels[String(g.escalation_level)] !== undefined) {
+          unresolved_escalation_levels[String(g.escalation_level)]++;
+       }
+    }
+
+    const resolvedWhere = {
+      status: { [Op.in]: ['resolved', 'closed'] },
+      resolved_at: {
+        [Op.gte]: startDate,
+        [Op.lt]: endDate
+      }
+    };
+    if (department) {
+      resolvedWhere.department = department;
+    }
+
+    const resolvedGrievancesList = await Grievance.findAll({
+      where: resolvedWhere,
+      attributes: ['createdAt', 'resolved_at']
+    });
+
+    let totalDurationMs = 0;
+    let resolved_sample_size = 0;
+
+    for (const g of resolvedGrievancesList) {
+      const created = new Date(g.createdAt);
+      const resolved = new Date(g.resolved_at);
+      if (!isNaN(created.getTime()) && !isNaN(resolved.getTime())) {
+        totalDurationMs += (resolved.getTime() - created.getTime());
+        resolved_sample_size++;
+      }
+    }
+
+    const round2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+    let average_resolution_hours = 0.0;
+    if (resolved_sample_size > 0) {
+      average_resolution_hours = round2(totalDurationMs / (1000 * 60 * 60) / resolved_sample_size);
+    }
+
+    res.json({
+      success: true,
+      generated_at: now.toISOString(),
+      historical_range: {
+        start: startDate.toISOString(),
+        end: endDate.toISOString()
+      },
+      current_state_scope: "all_active_records",
+      department_scope: department || null,
+      data: {
+        grievances_created_in_range: grievances_filed_in_range,
+        grievance_statuses: grievance_statuses_for_created_cohort,
+        grievances_resolved_in_range: resolvedGrievancesList.length,
+        average_grievance_resolution_time: {
+          avg_hours: average_resolution_hours,
+          sample_size: resolved_sample_size
+        },
+        unresolved_grievances: unresolvedGrievances.length,
+        unresolved_grievance_levels: unresolved_escalation_levels
+      }
+    });
+
+  } catch (err) {
+    console.error('[AnalyticsController Grievance] Unexpected error');
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { getOverviewAnalytics, getSlaAnalytics, getDepartmentBottleneckAnalytics, getInspectionAnalytics, getGrievanceAnalytics };

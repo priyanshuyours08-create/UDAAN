@@ -580,11 +580,13 @@ async function completeInspection(req, res) {
         // This is the final protection if the app later runs in more than one
         // Node.js process (where the in-memory mutex cannot help).
         // -----------------------------------------------------------------
+        const completedAt = new Date();
         const [affectedRows] = await Inspection.update(
           {
             status: 'completed',
             result: result,
             inspector_notes: inspector_notes || null,
+            completed_at: completedAt,
           },
           {
             where: {
@@ -653,7 +655,8 @@ async function completeInspection(req, res) {
         inspection: finalInspection,
       });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[InspectionController completeInspection] Unexpected error');
+    res.status(500).json({ error: 'Internal server error' });
   } finally {
     // Always release the per-inspection lock — an error must never leave
     // an inspection permanently locked.
