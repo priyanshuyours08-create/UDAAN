@@ -1,5 +1,5 @@
 const { Op, Sequelize } = require('sequelize');
-const { Application, ApprovalRule } = require('../models');
+const { Application, ApprovalRule, Grievance, GrievanceEscalation } = require('../models');
 
 function parseDateValid(val) {
   if (Array.isArray(val)) return null;
@@ -206,4 +206,237 @@ async function getOverviewAnalytics(req, res) {
   }
 }
 
-module.exports = { getOverviewAnalytics };
+async function getSlaAnalytics(req, res) {
+  try {
+    const allowedQueries = ['department'];
+    const providedQueries = Object.keys(req.query);
+    for (const key of providedQueries) {
+      if (!allowedQueries.includes(key)) {
+        return res.status(400).json({ error: `Unknown query parameter: ${key}` });
+      }
+    }
+    if (Array.isArray(req.query.department)) {
+      return res.status(400).json({ error: 'Repeated query parameters are not allowed' });
+    }
+
+    const { department } = req.analyticsScope;
+    const now = new Date();
+
+    let warningHours = Number(process.env.SLA_WARNING_HOURS);
+    if (!Number.isFinite(warningHours) || warningHours <= 0) {
+      warningHours = 48;
+    }
+    const warningEnd = new Date(now.getTime() + warningHours * 60 * 60 * 1000);
+
+    const baseInclude = [];
+    if (department) {
+      baseInclude.push({
+        model: ApprovalRule,
+        attributes: [],
+        where: { department }
+      });
+    }
+
+    const pendingOptions = {
+      attributes: ['sla_deadline', 'last_notified_level'],
+      where: {
+        status: { [Op.in]: ['submitted', 'pending_review', 'pending_inspection'] }
+      },
+      include: baseInclude,
+      raw: true
+    };
+
+    const pendingRecords = await Application.findAll(pendingOptions);
+
+    const sla_state = { breached: 0, warning: 0, on_track: 0, missing_deadline: 0 };
+    const notification_levels_for_pending = { none: 0, warning: 0, breach: 0 };
+
+    for (const record of pendingRecords) {
+      if (record.last_notified_level === 'none') notification_levels_for_pending.none++;
+      else if (record.last_notified_level === 'warning') notification_levels_for_pending.warning++;
+      else if (record.last_notified_level === 'breach') notification_levels_for_pending.breach++;
+      else notification_levels_for_pending.none++;
+
+      if (!record.sla_deadline) {
+        sla_state.missing_deadline++;
+      } else {
+        const deadline = new Date(record.sla_deadline);
+        if (deadline < now) {
+          sla_state.breached++;
+        } else if (deadline >= now && deadline <= warningEnd) {
+          sla_state.warning++;
+        } else if (deadline > warningEnd) {
+          sla_state.on_track++;
+        }
+      }
+    }
+
+    const pending_workload = sla_state.breached + sla_state.warning + sla_state.on_track + sla_state.missing_deadline;
+
+    res.json({
+      generated_at: now.toISOString(),
+      historical_range: null,
+      current_state_scope: "all_active_records",
+      department_scope: department || null,
+      data: {
+        warning_hours: warningHours,
+        pending_workload,
+        sla_state,
+        notification_levels_for_pending
+      }
+    });
+
+  } catch (err) {
+    console.error('[AnalyticsController SLA] Unexpected error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+async function getDepartmentBottleneckAnalytics(req, res) {
+  try {
+    const allowedQueries = ['department'];
+    const providedQueries = Object.keys(req.query);
+    for (const key of providedQueries) {
+      if (!allowedQueries.includes(key)) {
+        return res.status(400).json({ error: `Unknown query parameter: ${key}` });
+      }
+    }
+    if (Array.isArray(req.query.department)) {
+      return res.status(400).json({ error: 'Repeated query parameters are not allowed' });
+    }
+
+    const { department } = req.analyticsScope;
+    const now = new Date();
+
+    const rules = await ApprovalRule.findAll({
+      attributes: ['department'],
+      group: ['department'],
+      raw: true
+    });
+
+    const canonicalDepts = new Set();
+    for (const rule of rules) {
+      if (rule.department && rule.department.trim() !== '') {
+        canonicalDepts.add(rule.department.trim());
+      }
+    }
+
+    const rawDepts = rules.map(r => r.department);
+    const validRawDepts = rawDepts.filter(d => d && d.trim() !== '');
+    if (canonicalDepts.size !== validRawDepts.length) {
+      console.error('[AnalyticsController Bottleneck] Defect: Duplicate canonical department values found after trimming.');
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+
+    const targetDepts = department ? [department] : Array.from(canonicalDepts);
+
+    const pendingApps = await Application.findAll({
+      attributes: ['id', 'status', 'submitted_at', 'sla_deadline'],
+      where: {
+        status: { [Op.in]: ['submitted', 'pending_review', 'pending_inspection'] }
+      },
+      include: [{
+        model: ApprovalRule,
+        attributes: ['department'],
+        where: department ? { department } : {}
+      }],
+      raw: true
+    });
+
+    const highEscGrievances = await Grievance.findAll({
+      attributes: ['id', 'department'],
+      where: {
+        status: { [Op.in]: ['open', 'in_progress', 'escalated'] },
+        escalation_level: { [Op.in]: [2, 3] },
+        department: department ? department : { [Op.in]: targetDepts }
+      },
+      raw: true
+    });
+
+    const metricsByDept = {};
+    for (const dept of targetDepts) {
+      metricsByDept[dept] = {
+        pending_applications: 0,
+        breached_pending_applications: 0,
+        unresolved_high_escalation_grievances: 0,
+        age_sum: 0,
+        age_sample_size: 0
+      };
+    }
+
+    for (const app of pendingApps) {
+      const dept = app['ApprovalRule.department']?.trim();
+      if (!dept || !metricsByDept[dept]) continue;
+
+      metricsByDept[dept].pending_applications++;
+
+      if (app.sla_deadline) {
+        const deadline = new Date(app.sla_deadline);
+        if (deadline < now) {
+          metricsByDept[dept].breached_pending_applications++;
+        }
+      }
+
+      if (app.submitted_at) {
+        const submitted = new Date(app.submitted_at);
+        if (!isNaN(submitted.getTime()) && submitted <= now) {
+          metricsByDept[dept].age_sum += (now.getTime() - submitted.getTime());
+          metricsByDept[dept].age_sample_size++;
+        }
+      }
+    }
+
+    for (const g of highEscGrievances) {
+      const dept = g.department?.trim();
+      if (!dept || !metricsByDept[dept]) continue;
+      metricsByDept[dept].unresolved_high_escalation_grievances++;
+    }
+
+    const round2 = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
+
+    let results = [];
+    for (const dept of targetDepts) {
+      const m = metricsByDept[dept];
+      const bottleneck_score = m.pending_applications + (2 * m.breached_pending_applications) + (2 * m.unresolved_high_escalation_grievances);
+      const rawAgeHours = m.age_sample_size > 0 ? (m.age_sum / (1000 * 60 * 60) / m.age_sample_size) : 0;
+      const average_pending_age_hours = round2(rawAgeHours);
+
+      results.push({
+        department: dept,
+        pending_applications: m.pending_applications,
+        breached_pending_applications: m.breached_pending_applications,
+        unresolved_high_escalation_grievances: m.unresolved_high_escalation_grievances,
+        average_pending_age_hours,
+        age_sample_size: m.age_sample_size,
+        bottleneck_score,
+        _rawAgeHours: rawAgeHours
+      });
+    }
+
+    results.sort((a, b) => {
+      if (b.bottleneck_score !== a.bottleneck_score) return b.bottleneck_score - a.bottleneck_score;
+      if (b._rawAgeHours !== a._rawAgeHours) return b._rawAgeHours - a._rawAgeHours;
+      if (b.breached_pending_applications !== a.breached_pending_applications) return b.breached_pending_applications - a.breached_pending_applications;
+      return a.department.localeCompare(b.department);
+    });
+
+    results.forEach(r => delete r._rawAgeHours);
+
+    res.json({
+      generated_at: now.toISOString(),
+      historical_range: null,
+      current_state_scope: "all_active_records",
+      department_scope: department || null,
+      data: {
+        formula: "pending_applications + (2 * breached_pending_applications) + (2 * unresolved_high_escalation_grievances)",
+        departments: results
+      }
+    });
+
+  } catch (err) {
+    console.error('[AnalyticsController Bottleneck] Unexpected error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { getOverviewAnalytics, getSlaAnalytics, getDepartmentBottleneckAnalytics };
