@@ -12,7 +12,8 @@ const testFiles = [
   'priority5-grievance-foundation.test.js',
   'priority5-grievance-workflow.test.js',
   'priority5-grievance-escalation.test.js',
-  'priority5-compliance-integration.test.js'
+  'priority5-compliance-integration.test.js',
+  'priority6-analytics.test.js'
 ];
 
 let failed = false;
