@@ -3,7 +3,7 @@
 ## Overview & Scope
 All endpoints are available under `/api/admin/analytics`. They are protected by JWT authentication and RBAC (`authorize('admin', 'officer')`).
 - **Global Scope**: Admins calling without a `department` parameter view global statistics (including unclassified records where applicable).
-- **Department Scope**: 
+- **Department Scope**:
   - Officers are strictly scoped to their assigned canonical department.
   - Admins may filter by appending `?department=<canonical_department_name>`.
 
@@ -25,7 +25,7 @@ All endpoints are available under `/api/admin/analytics`. They are protected by 
 ## Endpoints
 
 ### 1. Overview
-`GET /api/admin/analytics/overview`  
+`GET /api/admin/analytics/overview`
 *(Legacy alias: `GET /api/admin/analytics`)*
 - **Purpose**: High-level application funnel and decision rates within a historical range, plus the current pending workload.
 - **Query Params**: `startDate`, `endDate`, `department`
