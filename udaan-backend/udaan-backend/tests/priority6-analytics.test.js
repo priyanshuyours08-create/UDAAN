@@ -131,14 +131,14 @@ async function run() {
     { applicant_id: 3, approval_rule_id: ruleFire.id, status: 'pending_review', submitted_at: now, last_notified_level: 'none' },
   ]);
 
-  adminToken = generateToken({ id: 1, role: 'admin', department: null });
+  adminToken = generateToken({ id: 1, role: 'admin', department: null, sla_deadline: new Date() });
   fireOfficerToken = generateToken({ id: 2, role: 'officer', department: fireDept });
   pollutionOfficerToken = generateToken({ id: 3, role: 'officer', department: pollutionDept });
-  nullDeptOfficerToken = generateToken({ id: 4, role: 'officer', department: null });
+  nullDeptOfficerToken = generateToken({ id: 4, role: 'officer', department: null, sla_deadline: new Date() });
   emptyDeptOfficerToken = generateToken({ id: 5, role: 'officer', department: '' });
   whitespaceDeptOfficerToken = generateToken({ id: 6, role: 'officer', department: '   gold  ' });
-  applicantToken = generateToken({ id: 7, role: 'applicant', department: null });
-  inspectorToken = generateToken({ id: 8, role: 'inspector', department: null });
+  applicantToken = generateToken({ id: 7, role: 'applicant', department: null, sla_deadline: new Date() });
+  inspectorToken = generateToken({ id: 8, role: 'inspector', department: null, sla_deadline: new Date() });
 
   server = app.listen(0, async () => {
     baseUrl = `http://127.0.0.1:` + server.address().port;
@@ -225,7 +225,7 @@ async function run() {
         await request(app).get('/api/admin/analytics/overview').expect(401);
       });
       it('M. Invalid JWT -> exactly 401', async () => {
-        await request(app).get('/api/admin/analytics/overview').set('Authorization', 'Bearer $$invalid_token').expect(401);
+        await request(app).get('/api/admin/analytics/overview').set('Authorization', 'Bearer $invalid_token').expect(401);
       });
       it('N. Legacy route and /overview return identical data', async () => {
         const resOverview = await request(app).get('/api/admin/analytics/overview').set('Authorization', `Bearer ${adminToken}`).expect(200);
@@ -752,8 +752,9 @@ async function run() {
         expect(await executePost()).toBe(200);
       });
       it('AU. Complete Priority 1-5 and Stage 1 regressions pass', async () => {
-        // Will be verified by the runner
-        customAssert(true);
+         const { execSync } = require('child_process');
+         const out = execSync('npx mocha tests/priority5-compliance-integration.test.js --exit', { encoding: 'utf-8' });
+         customAssert(out.includes('passing'), 'Priority 5 compliance suite passes');
       });
     });
 
@@ -1109,7 +1110,7 @@ async function run() {
          const exUser = await User.findOne({ where: { role: 'applicant' }});
          const dummyInspUser = await User.create({ name: 'O', email: 'o@ex.com', password_hash: 'xxx', role: 'inspector' });
          const dummyInsp = await Inspection.create({ applicant_id: exUser.id, assigned_inspector_id: dummyInspUser.id, status: 'scheduled' });
-         const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, generateToken({ id: 8888, role: 'inspector', department: null }), { result: 'pass', inspector_notes: 'OK' });
+         const res = await makePatchRequest(`/api/inspections/${dummyInsp.id}/complete`, generateToken({ id: 8888, role: 'inspector', department: null, sla_deadline: new Date() }), { result: 'pass', inspector_notes: 'OK' });
          customAssert(res.code === 403, 'Wrong inspector returns 403');
          const dbInsp = await Inspection.findByPk(dummyInsp.id);
          customAssert(dbInsp.completed_at === null, 'completed_at null');
@@ -1276,27 +1277,150 @@ console.log("Z body:", JSON.stringify(res.body)); customAssert(res.body.data.una
       });
 
       it('AI. Multi-department inspection counts once for admin global', async () => {
-         customAssert(true, 'Admin global count');
+         const { Inspection, Application, ApprovalRule, ApplicantProfile, User, InspectionApplication } = require('../src/models');
+         let inspId, apps = [], rules = [];
+         try {
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+            const r1 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F1', department: 'Fire Department', required_documents: [] });
+            const r2 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F2', department: 'Fire Department', required_documents: [] });
+            const r3 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'P1', department: 'Pollution Control Board', required_documents: [] });
+            rules = [r1, r2, r3];
+
+            const a1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r1.id, status: 'submitted' });
+            const a2 = await Application.create({ applicant_id: profile.id, approval_rule_id: r2.id, status: 'submitted' });
+            const a3 = await Application.create({ applicant_id: profile.id, approval_rule_id: r3.id, status: 'submitted' });
+            apps = [a1, a2, a3];
+
+            const pre = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            const insp = await Inspection.create({ applicant_id: profile.id, status: 'scheduled', scheduled_date: new Date() });
+            inspId = insp.id;
+
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a1.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a2.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a3.id });
+
+            const post = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            customAssert(post.body.data.unassigned_scheduled_inspections - pre.body.data.unassigned_scheduled_inspections === 1);
+         } finally {
+            if (inspId) {
+               await InspectionApplication.destroy({ where: { inspection_id: inspId } });
+               await Inspection.destroy({ where: { id: inspId } });
+            }
+            if (apps.length) await Application.destroy({ where: { id: apps.map(x=>x.id) } });
+            if (rules.length) await ApprovalRule.destroy({ where: { id: rules.map(x=>x.id) } });
+         }
       });
 
       it('AJ. Multi-department inspection counts once for Fire scope', async () => {
-         customAssert(true, 'Fire scope count');
+         const { Inspection, Application, ApprovalRule, ApplicantProfile, User, InspectionApplication } = require('../src/models');
+         let inspId, apps = [], rules = [];
+         try {
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+            const r1 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F1', department: 'Fire Department', required_documents: [] });
+            const r2 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F2', department: 'Fire Department', required_documents: [] });
+            const r3 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'P1', department: 'Pollution Control Board', required_documents: [] });
+            rules = [r1, r2, r3];
+
+            const a1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r1.id, status: 'submitted' });
+            const a2 = await Application.create({ applicant_id: profile.id, approval_rule_id: r2.id, status: 'submitted' });
+            const a3 = await Application.create({ applicant_id: profile.id, approval_rule_id: r3.id, status: 'submitted' });
+            apps = [a1, a2, a3];
+
+            const pre = await request(app).get('/api/admin/analytics/inspections?department=Fire%20Department').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            const insp = await Inspection.create({ applicant_id: profile.id, status: 'scheduled', scheduled_date: new Date() });
+            inspId = insp.id;
+
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a1.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a2.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a3.id });
+
+            const post = await request(app).get('/api/admin/analytics/inspections?department=Fire%20Department').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            customAssert(post.body.data.unassigned_scheduled_inspections - pre.body.data.unassigned_scheduled_inspections === 1);
+         } finally {
+            if (inspId) {
+               await InspectionApplication.destroy({ where: { inspection_id: inspId } });
+               await Inspection.destroy({ where: { id: inspId } });
+            }
+            if (apps.length) await Application.destroy({ where: { id: apps.map(x=>x.id) } });
+            if (rules.length) await ApprovalRule.destroy({ where: { id: rules.map(x=>x.id) } });
+         }
       });
 
       it('AK. Multi-department inspection counts once for Pollution scope', async () => {
-         customAssert(true, 'Pollution scope count');
+         const { Inspection, Application, ApprovalRule, ApplicantProfile, User, InspectionApplication } = require('../src/models');
+         let inspId, apps = [], rules = [];
+         try {
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+            const r1 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F1', department: 'Fire Department', required_documents: [] });
+            const r2 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'F2', department: 'Fire Department', required_documents: [] });
+            const r3 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'P1', department: 'Pollution Control Board', required_documents: [] });
+            rules = [r1, r2, r3];
+
+            const a1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r1.id, status: 'submitted' });
+            const a2 = await Application.create({ applicant_id: profile.id, approval_rule_id: r2.id, status: 'submitted' });
+            const a3 = await Application.create({ applicant_id: profile.id, approval_rule_id: r3.id, status: 'submitted' });
+            apps = [a1, a2, a3];
+
+            const pre = await request(app).get('/api/admin/analytics/inspections?department=Pollution%20Control%20Board').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            const insp = await Inspection.create({ applicant_id: profile.id, status: 'scheduled', scheduled_date: new Date() });
+            inspId = insp.id;
+
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a1.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a2.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: a3.id });
+
+            const post = await request(app).get('/api/admin/analytics/inspections?department=Pollution%20Control%20Board').set('Authorization', `Bearer ${adminToken}`).expect(200);
+
+            customAssert(post.body.data.unassigned_scheduled_inspections - pre.body.data.unassigned_scheduled_inspections === 1);
+         } finally {
+            if (inspId) {
+               await InspectionApplication.destroy({ where: { inspection_id: inspId } });
+               await Inspection.destroy({ where: { id: inspId } });
+            }
+            if (apps.length) await Application.destroy({ where: { id: apps.map(x=>x.id) } });
+            if (rules.length) await ApprovalRule.destroy({ where: { id: rules.map(x=>x.id) } });
+         }
       });
 
       it('AL. Inspection analytics causes zero database mutations', async () => {
-         customAssert(true, 'Zero mutations');
+         const { Notification, Inspection, Grievance, GrievanceEscalation, Application, ApprovalRule } = require('../src/models');
+         const getSnapshot = async () => {
+            return {
+               app: await Application.count(),
+               rule: await ApprovalRule.count(),
+               insp: await Inspection.count(),
+               griev: await Grievance.count(),
+            };
+         };
+         const before = await getSnapshot();
+         await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200);
+         const after = await getSnapshot();
+         customAssert(before.app === after.app);
+         customAssert(before.rule === after.rule);
+         customAssert(before.insp === after.insp);
+         customAssert(before.griev === after.griev);
       });
 
       it('AM. Unexpected inspection analytics failure returns safe 500', async () => {
          const origFind = Inspection.findAll;
-         Inspection.findAll = async () => { throw new Error('DB Error'); };
-         const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(500);
-         customAssert(res.body.error === 'Internal server error', 'Safe 500 exactly matched');
-         Inspection.findAll = origFind; // Restore
+         try {
+            Inspection.findAll = async () => { throw new Error('DB Error'); };
+            const res = await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(500);
+            customAssert(res.body.error === 'Internal server error', 'Safe 500 exactly matched');
+         } finally {
+            Inspection.findAll = origFind; // Restore
+         }
          await request(app).get('/api/admin/analytics/inspections').set('Authorization', `Bearer ${adminToken}`).expect(200); // retry succeeds
       });
 
@@ -1567,7 +1691,7 @@ console.log("Z body:", JSON.stringify(res.body)); customAssert(res.body.data.una
 
          const g1 = await Grievance.create({ applicant_id: 1, status: 'resolved', resolved_at: new Date(), subject: 'test', description: 'test', sla_deadline: new Date() });
          const g2 = await Grievance.create({ applicant_id: 1, status: 'resolved', resolved_at: new Date(), subject: 'test', description: 'test', sla_deadline: new Date() });
-         await Grievance.sequelize.query(`UPDATE Grievances SET createdAt = 'invalid_date' WHERE id = ${g2.id}`);
+         await Grievance.update({ createdAt: 'invalid_date' }, { where: { id: g2.id }, silent: true });
 
          const postRes = await request(app).get('/api/admin/analytics/grievances').set('Authorization', `Bearer ${adminToken}`).expect(200);
          const postCount = postRes.body.data.grievances_resolved_in_range;
@@ -1580,6 +1704,209 @@ console.log("Z body:", JSON.stringify(res.body)); customAssert(res.body.data.una
       });
 
     });
+
+
+
+describe('Decision Exact Counts (33-36)', () => {
+         let ruleId, appIds = [];
+         it('setup', async () => {
+            const { Application, ApprovalRule, ApplicantProfile, User } = require('../src/models');
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+            const rule = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'test33-36', department: fireDept, required_documents: [] });
+            ruleId = rule.id;
+            const startStr = '2090-04-01T12:00:00.000Z';
+
+            const app1 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'approved' });
+            const app2 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'auto_approved' });
+            const app3 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'rejected' });
+            const app4 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'pending_review' }); // non-decision
+            const app5 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'approved' }); // exact end
+
+            appIds = [app1.id, app2.id, app3.id, app4.id, app5.id];
+
+            await Application.sequelize.query(`UPDATE Applications SET decided_at = '${startStr.replace('T',' ').replace('Z',' +00:00')}' WHERE id IN (${app1.id}, ${app2.id}, ${app3.id})`);
+            await Application.update({ decided_at: '2090-04-02 00:00:00.000 +00:00' }, { where: { id: app5.id }, silent: true });
+         });
+
+
+
+         it('33. exact approved decision counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2090-04-01T00:00:00.000Z&endDate=2090-04-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const dec = res.body.data.buckets[0].application_decisions;
+            customAssert(dec.approved === 1);
+         });
+
+         it('34. exact auto-approved decision counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2090-04-01T00:00:00.000Z&endDate=2090-04-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const dec = res.body.data.buckets[0].application_decisions;
+            customAssert(dec.auto_approved === 1);
+         });
+
+         it('35. exact rejected decision counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2090-04-01T00:00:00.000Z&endDate=2090-04-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const dec = res.body.data.buckets[0].application_decisions;
+            customAssert(dec.rejected === 1);
+         });
+
+         it('36. decision total invariant', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2090-04-01T00:00:00.000Z&endDate=2090-04-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            const dec = res.body.data.buckets[0].application_decisions;
+            customAssert(dec.total === 3);
+            customAssert(dec.total === dec.approved + dec.auto_approved + dec.rejected);
+         });
+
+         it('teardown', async () => {
+            const { Application, ApprovalRule } = require('../src/models');
+            await Application.destroy({ where: { id: appIds } });
+            await ApprovalRule.destroy({ where: { id: ruleId } });
+         });
+      });
+
+describe('Event Exact Counts (37-39)', () => {
+         let inspIds = [], appIds = [], grievanceIds = [], ruleId;
+         it('setup', async () => {
+            const { Inspection, InspectionApplication, Application, ApprovalRule, Grievance, ApplicantProfile, User } = require('../src/models');
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+            const rule = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'test37-39', department: fireDept, required_documents: [] });
+            ruleId = rule.id;
+            const app1 = await Application.create({ applicant_id: profile.id, approval_rule_id: rule.id, status: 'approved' });
+            appIds = [app1.id];
+
+            // Inspections
+            const insp1 = await Inspection.create({ applicant_id: profile.id, status: 'completed' });
+            const insp2 = await Inspection.create({ applicant_id: profile.id, status: 'completed' }); // before start
+            const insp3 = await Inspection.create({ applicant_id: profile.id, status: 'completed' }); // exactly at end
+            inspIds = [insp1.id, insp2.id, insp3.id];
+
+            await InspectionApplication.create({ inspection_id: insp1.id, application_id: app1.id });
+            await InspectionApplication.create({ inspection_id: insp2.id, application_id: app1.id });
+            await InspectionApplication.create({ inspection_id: insp3.id, application_id: app1.id });
+
+            await Inspection.update({ completed_at: '2021-05-01 12:00:00.000 +00:00' }, { where: { id: insp1.id }, silent: true });
+            await Inspection.update({ completed_at: '2021-04-30 23:59:59.000 +00:00' }, { where: { id: insp2.id }, silent: true });
+            await Inspection.update({ completed_at: '2021-05-02 00:00:00.000 +00:00' }, { where: { id: insp3.id }, silent: true });
+
+            // Grievances
+            const g1 = await Grievance.create({ applicant_id: profile.id, subject: '1', description: 'desc', priority: 'medium', status: 'open', department: fireDept, sla_deadline: new Date() });
+            const g2 = await Grievance.create({ applicant_id: profile.id, subject: '2', description: 'desc', priority: 'medium', status: 'open', department: fireDept, sla_deadline: new Date() }); // before
+            const g3 = await Grievance.create({ applicant_id: profile.id, subject: '3', description: 'desc', priority: 'medium', status: 'open', department: fireDept, sla_deadline: new Date() }); // end
+            const g4 = await Grievance.create({ applicant_id: profile.id, subject: '4', description: 'desc', priority: 'medium', status: 'resolved', department: fireDept, sla_deadline: new Date() });
+            const g5 = await Grievance.create({ applicant_id: profile.id, subject: '5', description: 'desc', priority: 'medium', status: 'resolved', department: fireDept, sla_deadline: new Date() }); // before
+            const g6 = await Grievance.create({ applicant_id: profile.id, subject: '6', description: 'desc', priority: 'medium', status: 'resolved', department: fireDept, sla_deadline: new Date() }); // end
+            const g7 = await Grievance.create({ applicant_id: profile.id, subject: '7', description: 'desc', priority: 'medium', status: 'open', department: fireDept, sla_deadline: new Date() }); // unresolved, created in range
+            grievanceIds = [g1.id, g2.id, g3.id, g4.id, g5.id, g6.id, g7.id];
+
+            await Grievance.update({ createdAt: '2021-05-01 12:00:00.000 +00:00' }, { where: { id: [g1.id, g7.id] }, silent: true });
+            await Grievance.update({ createdAt: '2021-04-30 23:59:59.000 +00:00' }, { where: { id: g2.id }, silent: true });
+            await Grievance.update({ createdAt: '2021-05-02 00:00:00.000 +00:00' }, { where: { id: g3.id }, silent: true });
+
+            await Grievance.update({ resolved_at: '2021-05-01 12:00:00.000 +00:00' }, { where: { id: g4.id }, silent: true });
+            await Grievance.update({ resolved_at: '2021-04-30 23:59:59.000 +00:00' }, { where: { id: g5.id }, silent: true });
+            await Grievance.update({ resolved_at: '2021-05-02 00:00:00.000 +00:00' }, { where: { id: g6.id }, silent: true });
+         });
+
+
+
+         it('37. exact completed inspection counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2021-05-01T00:00:00.000Z&endDate=2021-05-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            console.log('BUCKET:', res.body.data.buckets[0]); const { Inspection } = require('../src/models'); const insps = await Inspection.findAll({raw:true}); console.log('ALL INSPS:', insps); customAssert(res.body.data.buckets[0].inspections_completed === 1);
+         });
+
+         it('38. exact grievance-created counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2021-05-01T00:00:00.000Z&endDate=2021-05-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            customAssert(res.body.data.buckets[0].grievances_created === 2);
+         });
+
+         it('39. exact grievance-resolved counts', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2021-05-01T00:00:00.000Z&endDate=2021-05-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            customAssert(res.body.data.buckets[0].grievances_resolved === 1);
+         });
+
+         it('teardown', async () => {
+            const { Inspection, InspectionApplication, Application, ApprovalRule, Grievance } = require('../src/models');
+            await InspectionApplication.destroy({ where: { inspection_id: inspIds } });
+            await Inspection.destroy({ where: { id: inspIds } });
+            await Application.destroy({ where: { id: appIds } });
+            await ApprovalRule.destroy({ where: { id: ruleId } });
+            await Grievance.destroy({ where: { id: grievanceIds } });
+         });
+      });
+
+
+describe('Multi-Department and Unclassified (41-45)', () => {
+         let inspId, appIds = [], ruleIds = [], grievanceId;
+         const fireDept = 'Fire Department';
+         const pollutionDept = 'Pollution Control Board';
+
+         it('setup', async () => {
+            const { Inspection, InspectionApplication, Application, ApprovalRule, Grievance, ApplicantProfile, User } = require('../src/models');
+            const exUser = await User.findOne({ where: { role: 'applicant' }});
+            const profile = await ApplicantProfile.findOne({ where: { user_id: exUser.id } });
+
+            const r1 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Fire1', department: fireDept, required_documents: [] });
+            const r2 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Fire2', department: fireDept, required_documents: [] });
+            const r3 = await ApprovalRule.create({ sector: 'all', state: 'all', approval_name: 'Pol1', department: pollutionDept, required_documents: [] });
+            ruleIds = [r1.id, r2.id, r3.id];
+
+            const app1 = await Application.create({ applicant_id: profile.id, approval_rule_id: r1.id, status: 'submitted' });
+            const app2 = await Application.create({ applicant_id: profile.id, approval_rule_id: r2.id, status: 'submitted' });
+            const app3 = await Application.create({ applicant_id: profile.id, approval_rule_id: r3.id, status: 'submitted' });
+            appIds = [app1.id, app2.id, app3.id];
+
+            const insp = await Inspection.create({ applicant_id: profile.id, status: 'completed' });
+            inspId = insp.id;
+
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: app1.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: app2.id });
+            await InspectionApplication.create({ inspection_id: insp.id, application_id: app3.id });
+
+            const upRes = await Inspection.update({ completed_at: new Date('2093-06-01T12:00:00.000Z') }, { where: { id: insp.id }, silent: true }); console.log('INSP UP RES:', upRes);
+
+            const g1 = await Grievance.create({ applicant_id: profile.id, subject: 'Unclass', description: 'desc', priority: 'low', status: 'open', department: null, sla_deadline: new Date() });
+            grievanceId = g1.id;
+            await Grievance.update({ createdAt: '2093-06-01 12:00:00.000 +00:00' }, { where: { id: g1.id }, silent: true });
+         });
+
+
+
+         it('41. multi-department admin deduplication', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2093-06-01T00:00:00.000Z&endDate=2093-06-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            console.log('BUCKET:', res.body.data.buckets[0]); const { Inspection } = require('../src/models'); const insps = await Inspection.findAll({raw:true}); console.log('ALL INSPS:', insps); customAssert(res.body.data.buckets[0].inspections_completed === 1);
+         });
+
+         it('42. multi-department Fire count', async () => {
+            const res = await request(app).get(`/api/admin/analytics/trends?startDate=2093-06-01T00:00:00.000Z&endDate=2093-06-02T00:00:00.000Z&department=${encodeURIComponent('Fire Department')}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+            console.log('BUCKET:', res.body.data.buckets[0]); const { Inspection } = require('../src/models'); const insps = await Inspection.findAll({raw:true}); console.log('ALL INSPS:', insps); customAssert(res.body.data.buckets[0].inspections_completed === 1);
+         });
+
+         it('43. multi-department Pollution count', async () => {
+            const res = await request(app).get(`/api/admin/analytics/trends?startDate=2093-06-01T00:00:00.000Z&endDate=2093-06-02T00:00:00.000Z&department=${encodeURIComponent('Pollution Control Board')}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+            console.log('BUCKET:', res.body.data.buckets[0]); const { Inspection } = require('../src/models'); const insps = await Inspection.findAll({raw:true}); console.log('ALL INSPS:', insps); customAssert(res.body.data.buckets[0].inspections_completed === 1);
+         });
+
+         it('44. unclassified grievance global behavior', async () => {
+            const res = await request(app).get('/api/admin/analytics/trends?startDate=2093-06-01T00:00:00.000Z&endDate=2093-06-02T00:00:00.000Z').set('Authorization', `Bearer ${adminToken}`).expect(200);
+            customAssert(res.body.data.buckets[0].grievances_created === 1);
+         });
+
+         it('45. unclassified grievance excluded from department scope', async () => {
+            const res = await request(app).get(`/api/admin/analytics/trends?startDate=2093-06-01T00:00:00.000Z&endDate=2093-06-02T00:00:00.000Z&department=${encodeURIComponent('Fire Department')}`).set('Authorization', `Bearer ${adminToken}`).expect(200);
+            customAssert(res.body.data.buckets[0].grievances_created === 0);
+         });
+
+         it('teardown', async () => {
+            const { Inspection, InspectionApplication, Application, ApprovalRule, Grievance } = require('../src/models');
+            await InspectionApplication.destroy({ where: { inspection_id: inspId } });
+            await Inspection.destroy({ where: { id: inspId } });
+            await Application.destroy({ where: { id: appIds } });
+            await ApprovalRule.destroy({ where: { id: ruleIds } });
+            await Grievance.destroy({ where: { id: grievanceId } });
+         });
+      });
+
+
 
 
     let failed = 0;

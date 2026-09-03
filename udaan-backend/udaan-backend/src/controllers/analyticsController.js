@@ -716,4 +716,141 @@ async function getGrievanceAnalytics(req, res) {
   }
 }
 
-module.exports = { getOverviewAnalytics, getSlaAnalytics, getDepartmentBottleneckAnalytics, getInspectionAnalytics, getGrievanceAnalytics };
+
+
+async function getTrendsAnalytics(req, res) {
+  try {
+    let startDate = parseDateValid(req.query.startDate);
+    let endDate = parseDateValid(req.query.endDate);
+
+    if (!startDate || !endDate || startDate >= endDate) {
+      return res.status(400).json({ error: 'Valid startDate and endDate required' });
+    }
+
+    const { department } = req.analyticsScope;
+
+    const baseInclude = [];
+    if (department) {
+      baseInclude.push({
+        model: ApprovalRule,
+
+        attributes: [],
+        where: { department }
+      });
+    }
+
+
+    const decisions_completed_in_range = await Application.count({
+      where: {
+        status: { [Op.in]: ['approved', 'auto_approved', 'rejected'] },
+        decided_at: {
+          [Op.gte]: startDate,
+          [Op.lt]: endDate
+        }
+      },
+      include: baseInclude
+    });
+
+    const decisionStatusCountsRaw = await Application.findAll({
+      attributes: ['status', [Sequelize.fn('COUNT', Sequelize.col('Application.id')), 'count']],
+      where: {
+        status: { [Op.in]: ['approved', 'auto_approved', 'rejected'] },
+        decided_at: {
+          [Op.gte]: startDate,
+          [Op.lt]: endDate
+        }
+      },
+      include: baseInclude,
+      group: ['Application.status'],
+      raw: true
+    });
+
+    let approved = 0;
+    let auto_approved = 0;
+    let rejected = 0;
+    let total = decisions_completed_in_range;
+
+    for (const row of decisionStatusCountsRaw) {
+      const c = parseInt(row.count, 10);
+      if (row.status === 'approved') approved = c;
+      if (row.status === 'auto_approved') auto_approved = c;
+      if (row.status === 'rejected') rejected = c;
+    }
+
+
+    const inspInclude = department ? [{
+      model: Application,
+      required: true,
+      include: [{
+        model: ApprovalRule,
+        required: true,
+        where: { department }
+      }]
+    }] : [];
+
+    const inspections = await Inspection.findAll({
+      where: {
+        completed_at: {
+          [Op.gte]: startDate,
+          [Op.lt]: endDate
+        },
+        status: 'completed'
+      },
+      include: inspInclude,
+      attributes: ['id']
+    });
+
+    const uniqueInsp = new Set();
+    inspections.forEach(i => uniqueInsp.add(i.id));
+    const inspections_completed = uniqueInsp.size;
+
+    const grievCreatedWhere = {
+      createdAt: {
+        [Op.gte]: startDate,
+        [Op.lt]: endDate
+      }
+    };
+    if (department) grievCreatedWhere.department = department;
+
+    const grievances_created = await Grievance.count({
+      where: grievCreatedWhere
+    });
+
+    const grievResolvedWhere = {
+      resolved_at: {
+        [Op.gte]: startDate,
+        [Op.lt]: endDate
+      },
+      status: 'resolved'
+    };
+    if (department) grievResolvedWhere.department = department;
+
+    const grievances_resolved = await Grievance.count({
+      where: grievResolvedWhere
+    });
+
+    res.json({
+      data: {
+        buckets: [
+          {
+            application_decisions: {
+              approved,
+              auto_approved,
+              rejected,
+              total
+            },
+            inspections_completed,
+            grievances_created,
+            grievances_resolved
+          }
+        ]
+      }
+    });
+
+  } catch (err) {
+    console.error('[AnalyticsController Trends] Unexpected error', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { getTrendsAnalytics, getTrendsAnalytics, getOverviewAnalytics, getSlaAnalytics, getDepartmentBottleneckAnalytics, getInspectionAnalytics, getGrievanceAnalytics };
